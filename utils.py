@@ -51,6 +51,121 @@ def bilinear_sampler(img, x, y):
     out = wa*Ia + wb*Ib + wc*Ic + wd*Id
 
     return out
+def get_pixel_value3d(mpi, y, x, z):
+    indices = tf.stack([z, y, x], -1)
+    return tf.gather_nd(mpi, indices)
+
+def linear3d_sampler(mpi, x, y, z):
+  D = int(mpi.get_shape()[0])
+  H = int(mpi.get_shape()[1])
+  W = int(mpi.get_shape()[2])
+  max_y = tf.cast(H-1, tf.int32)
+  max_x = tf.cast(W-1, tf.int32)
+  max_z = tf.cast(D-1, tf.int32)
+  zero = tf.zeros([], dtype='int32')
+
+  x = ((x)*tf.cast(max_x-1, tf.float32))
+  y = ((y)*tf.cast(max_y-1, tf.float32))
+  z = (z * tf.cast(max_z-1, tf.float32))
+
+  x0 = tf.cast(tf.floor(x), tf.int32)
+  x1 = x0 + 1
+  y0 = tf.cast(tf.floor(y), tf.int32)
+  y1 = y0 + 1
+  z0 = tf.cast(tf.floor(z), tf.int32)
+  z1 = z0 + 1
+
+  x0 = tf.clip_by_value(x0, zero, max_x)
+  x1 = tf.clip_by_value(x1, zero, max_x)
+  y0 = tf.clip_by_value(y0, zero, max_y)
+  y1 = tf.clip_by_value(y1, zero, max_y)
+  z0 = tf.clip_by_value(z0, zero, max_z)
+  z1 = tf.clip_by_value(z1, zero, max_z)
+
+  Ia = get_pixel_value3d(mpi, y0, x0, z0)
+  Ib = get_pixel_value3d(mpi, y0, x1, z0)
+  Ic = get_pixel_value3d(mpi, y1, x0, z0)
+  Id = get_pixel_value3d(mpi, y1, x1, z0)
+
+
+  Ia1 = get_pixel_value3d(mpi, y0, x0, z1)
+  Ib1 = get_pixel_value3d(mpi, y0, x1, z1)
+  Ic1 = get_pixel_value3d(mpi, y1, x0, z1)
+  Id1 = get_pixel_value3d(mpi, y1, x1, z1)
+
+  x0 = tf.cast(x0, tf.float32)
+  x1 = tf.cast(x1, tf.float32)
+  y0 = tf.cast(y0, tf.float32)
+  y1 = tf.cast(y1, tf.float32)
+  z0 = tf.cast(z0, tf.float32)
+  z1 = tf.cast(z1, tf.float32)
+
+  wa = (y1-y)*(x1-x)
+  wb = (y1-y)*(x-x0)
+  wc = (y-y0)*(x1-x)
+  wd = (y-y0)*(x-x0)
+
+  wa = tf.expand_dims(wa, axis=-1)
+  wb = tf.expand_dims(wb, axis=-1)
+  wc = tf.expand_dims(wc, axis=-1)
+  wd = tf.expand_dims(wd, axis=-1)
+  z1z= tf.expand_dims(z1-z, axis=-1)
+  z0z= tf.expand_dims(z-z0, axis=-1)
+
+  out = wa*Ia + wb*Ib + wc*Ic + wd*Id
+  out *= z1z
+  out += z0z*(wa*Ia1 + wb*Ib1 + wc*Ic1 + wd*Id1)
+
+  return out
+
+def nearest3d_sampler(mpi, x, y, z):
+  D = int(mpi.get_shape()[0])
+  H = int(mpi.get_shape()[1])
+  W = int(mpi.get_shape()[2])
+  max_y = tf.cast(H-1, tf.int32)
+  max_x = tf.cast(W-1, tf.int32)
+  max_z = tf.cast(D-1, tf.int32)
+  zero = tf.zeros([], dtype='int32')
+
+  x = ((x)*tf.cast(max_x-1, tf.float32))
+  y = ((y)*tf.cast(max_y-1, tf.float32))
+  z = (z * tf.cast(max_z-1, tf.float32))
+
+  x0 = tf.cast(tf.floor(x), tf.int32)
+  x1 = x0 + 1
+  y0 = tf.cast(tf.floor(y), tf.int32)
+  y1 = y0 + 1
+  zz = tf.cast(tf.round(z), tf.int32)
+
+  x0 = tf.clip_by_value(x0, zero, max_x)
+  x1 = tf.clip_by_value(x1, zero, max_x)
+  y0 = tf.clip_by_value(y0, zero, max_y)
+  y1 = tf.clip_by_value(y1, zero, max_y)
+  zz = tf.clip_by_value(zz, zero, max_z)
+
+  Ia = get_pixel_value3d(mpi, y0, x0, zz)
+  Ib = get_pixel_value3d(mpi, y0, x1, zz)
+  Ic = get_pixel_value3d(mpi, y1, x0, zz)
+  Id = get_pixel_value3d(mpi, y1, x1, zz)
+
+  x0 = tf.cast(x0, tf.float32)
+  x1 = tf.cast(x1, tf.float32)
+  y0 = tf.cast(y0, tf.float32)
+  y1 = tf.cast(y1, tf.float32)
+  zz = tf.cast(zz, tf.float32)
+
+  wa = (y1-y)*(x1-x)
+  wb = (y1-y)*(x-x0)
+  wc = (y-y0)*(x1-x)
+  wd = (y-y0)*(x-x0)
+
+  wa = tf.expand_dims(wa, axis=-1)
+  wb = tf.expand_dims(wb, axis=-1)
+  wc = tf.expand_dims(wc, axis=-1)
+  wd = tf.expand_dims(wd, axis=-1)
+
+  out = wa*Ia + wb*Ib + wc*Ic + wd*Id
+  return out
 
 def findCameraSfm(dataset):
   path = "datasets/" + dataset + "/MeshroomCache/StructureFromMotion/"

@@ -8,13 +8,15 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from tensorflow.compat.v1 import ConfigProto
 from mpl_toolkits.mplot3d import Axes3D
-import memory_saving_gradients
+#import memory_saving_gradients
+from view_gen import generateWebGL
+import cv2
+
 # monkey patch tf.gradients to point to our custom version, with automatic checkpoint selection
 #tf.__dict__["gradients"] = memory_saving_gradients.gradients_memory
-tf.__dict__["gradients"] = memory_saving_gradients.gradients_collection
+#tf.__dict__["gradients"] = memory_saving_gradients.gradients_collection
 
 from utils import *
-#from gen_tfrecord import findCameraSfm
 
 slim = tf.contrib.slim
 FLAGS = tf.app.flags.FLAGS
@@ -24,21 +26,23 @@ tf.app.flags.DEFINE_boolean("predict", False, "make a video")
 tf.app.flags.DEFINE_float("scale", 1.0, "scale input image by")
 
 tf.app.flags.DEFINE_integer("layers", 25, "number of planes")
-tf.app.flags.DEFINE_integer("epoch", 500, "Training steps")
+tf.app.flags.DEFINE_integer("epoch", 100, "Training steps")
 tf.app.flags.DEFINE_integer("batch_size", 1, "Size of mini-batch.")
 
 tf.app.flags.DEFINE_string("dataset", "temple1", "which dataset in the datasets folder")
 tf.app.flags.DEFINE_string("input", "temple-all", "input tfrecord")
+tf.app.flags.DEFINE_string("version", "", "additional name")
 
 tf.app.flags.DEFINE_string("ref_img", "0004.png", "reference image such that MPI is perfectly parallel to")
 
 
-laten_h, laten_w, laten_d, laten_ch = 60,60,60,4#50, 50, 50, 4
+laten_h, laten_w, laten_d, laten_ch = 60,60,80,4#50, 50, 50, 4
 #laten_h, laten_w, laten_d, laten_ch = 35,20,20,4
 #texture resolution
-size_h, size_w = 271, 362#362, 483
-sub_sam = 20
-num_mpi = 6
+size_h, size_w =  271, 362 # 362, 483 #
+sub_sam = 15
+num_mpi = 5
+reuse_fac = 1
 f = px = py = 0
 ref_r = ref_t = 0
 offset = 0
@@ -64,7 +68,6 @@ def load_data():
     fs["t"] = tf.reshape(fs["t"], [3, 1])
     return fs
 
-  # np.random.shuffle(filenames)
   dataset = tf.data.TFRecordDataset(["datasets/" + FLAGS.dataset + "/" + FLAGS.input + ".train"])
   dataset = dataset.map(parser)
   #dataset = dataset.shuffle(5)
@@ -97,6 +100,12 @@ def setGlobalVariables():
           ref_t = -ref_r * np.reshape(np.matrix(pose["pose"]["transform"]["center"], dtype='f'), [3, 1])
           ref_c = np.reshape(np.matrix(pose["pose"]["transform"]["center"], dtype='f'), [3, 1])
           st = 1
+          image_path = "datasets/" + FLAGS.dataset + "/undistorted/"+view["path"].split("/")[-1][:-3]+"png"
+          ref_photo = (plt.imread(image_path) * 255).astype(int)
+          #ref_photo = cv2.resize(ref_photo,(h,w))
+          #plt.imshow(ref_img)
+          #plt.show()
+          #exit()
           break
       break
 
@@ -111,141 +120,25 @@ def setGlobalVariables():
        ccx,dx = [float(x) for x in fi.readline().split(" ")]
        ccy,dy = [float(x) for x in fi.readline().split(" ")]
        ccz,dz = [float(x) for x in fi.readline().split(" ")]
-     #dx *= 1.1
-     #dy *= 1.1
-     #dz *= 1.3
-     #ccx -= 0.15
-     #ccy -= 0.15
-     #ccz -= 0.35
-     ccx -= 0.5#1.1
-     ccy -= 1.1#1.1
-     ccz -= 0.25#0.25
-     dis=np.linalg.norm(np.transpose(ref_c) - [ccx,ccy,ccz],2)
+     dx *= 1.0
+     dy *= 1.0
+     dz *= 1.0
+     ccx -= 0.65
+     ccy -= 0.15
+     ccz -= 0.25 #.35
+
+     ##set bball
+     #dz *= 0.9
+     #ccx -= 2.5
+     #ccy -= 3.1#1.1
+     #ccz -= 3.1#0.25
+
+     dis = np.linalg.norm(np.transpose(ref_c) - [ccx,ccy,ccz],2)
      #cop = (dx+dy+dz+2*np.amax([dx,dy,dz]))/5
      #cop = (dx+dy+3*dz)/6.5
-     cop = (dx+dy+3*dz)/5
+     cop = (dx+dy+3*dz)/8.0
      dmin = dis-cop
      dmax = dis+cop
-
-#def get_pixel_value(mpi, x, y, z):#
-#    indices = tf.stack([z, x, y], -1)
-#    return tf.gather_nd(mpi, indices)
-
-def get_pixel_value(mpi, y, x, z):
-    indices = tf.stack([z, y, x], -1)
-    return tf.gather_nd(mpi, indices)
-
-def linear3d_sampler(mpi, x, y, z):
-  D = int(mpi.get_shape()[0])
-  H = int(mpi.get_shape()[1])
-  W = int(mpi.get_shape()[2])
-  max_y = tf.cast(H-1, tf.int32)
-  max_x = tf.cast(W-1, tf.int32)
-  max_z = tf.cast(D-1, tf.int32)
-  zero = tf.zeros([], dtype='int32')
-
-  x = ((x)*tf.cast(max_x-1, tf.float32))
-  y = ((y)*tf.cast(max_y-1, tf.float32))
-  z = (z * tf.cast(max_z-1, tf.float32))
-
-  x0 = tf.cast(tf.floor(x), tf.int32)
-  x1 = x0 + 1
-  y0 = tf.cast(tf.floor(y), tf.int32)
-  y1 = y0 + 1
-  z0 = tf.cast(tf.floor(z), tf.int32)
-  z1 = z0 + 1
-
-  x0 = tf.clip_by_value(x0, zero, max_x)
-  x1 = tf.clip_by_value(x1, zero, max_x)
-  y0 = tf.clip_by_value(y0, zero, max_y)
-  y1 = tf.clip_by_value(y1, zero, max_y)
-  z0 = tf.clip_by_value(z0, zero, max_z)
-  z1 = tf.clip_by_value(z1, zero, max_z)
-
-  Ia = get_pixel_value(mpi, y0, x0, z0)
-  Ib = get_pixel_value(mpi, y0, x1, z0)
-  Ic = get_pixel_value(mpi, y1, x0, z0)
-  Id = get_pixel_value(mpi, y1, x1, z0)
-
-
-  Ia1 = get_pixel_value(mpi, y0, x0, z1)
-  Ib1 = get_pixel_value(mpi, y0, x1, z1)
-  Ic1 = get_pixel_value(mpi, y1, x0, z1)
-  Id1 = get_pixel_value(mpi, y1, x1, z1)
-
-  x0 = tf.cast(x0, tf.float32)
-  x1 = tf.cast(x1, tf.float32)
-  y0 = tf.cast(y0, tf.float32)
-  y1 = tf.cast(y1, tf.float32)
-  z0 = tf.cast(z0, tf.float32)
-  z1 = tf.cast(z1, tf.float32)
-
-  wa = (y1-y)*(x1-x)
-  wb = (y1-y)*(x-x0)
-  wc = (y-y0)*(x1-x)
-  wd = (y-y0)*(x-x0)
-
-  wa = tf.expand_dims(wa, axis=-1)
-  wb = tf.expand_dims(wb, axis=-1)
-  wc = tf.expand_dims(wc, axis=-1)
-  wd = tf.expand_dims(wd, axis=-1)
-  z1z= tf.expand_dims(z1-z, axis=-1)
-  z0z= tf.expand_dims(z-z0, axis=-1)
-
-  out = wa*Ia + wb*Ib + wc*Ic + wd*Id
-  out *= z1z
-  out += z0z*(wa*Ia1 + wb*Ib1 + wc*Ic1 + wd*Id1)
-
-  return out
-
-def nearest3d_sampler(mpi, x, y, z):
-  D = int(mpi.get_shape()[0])
-  H = int(mpi.get_shape()[1])
-  W = int(mpi.get_shape()[2])
-  max_y = tf.cast(H-1, tf.int32)
-  max_x = tf.cast(W-1, tf.int32)
-  max_z = tf.cast(D-1, tf.int32)
-  zero = tf.zeros([], dtype='int32')
-
-  x = ((x)*tf.cast(max_x-1, tf.float32))
-  y = ((y)*tf.cast(max_y-1, tf.float32))
-  z = (z * tf.cast(max_z-1, tf.float32))
-
-  x0 = tf.cast(tf.floor(x), tf.int32)
-  x1 = x0 + 1
-  y0 = tf.cast(tf.floor(y), tf.int32)
-  y1 = y0 + 1
-  zz = tf.cast(tf.round(z), tf.int32)
-
-  x0 = tf.clip_by_value(x0, zero, max_x)
-  x1 = tf.clip_by_value(x1, zero, max_x)
-  y0 = tf.clip_by_value(y0, zero, max_y)
-  y1 = tf.clip_by_value(y1, zero, max_y)
-  zz = tf.clip_by_value(zz, zero, max_z)
-
-  Ia = get_pixel_value(mpi, y0, x0, zz)
-  Ib = get_pixel_value(mpi, y0, x1, zz)
-  Ic = get_pixel_value(mpi, y1, x0, zz)
-  Id = get_pixel_value(mpi, y1, x1, zz)
-
-  x0 = tf.cast(x0, tf.float32)
-  x1 = tf.cast(x1, tf.float32)
-  y0 = tf.cast(y0, tf.float32)
-  y1 = tf.cast(y1, tf.float32)
-  zz = tf.cast(zz, tf.float32)
-
-  wa = (y1-y)*(x1-x)
-  wb = (y1-y)*(x-x0)
-  wc = (y-y0)*(x1-x)
-  wd = (y-y0)*(x-x0)
-
-  wa = tf.expand_dims(wa, axis=-1)
-  wb = tf.expand_dims(wb, axis=-1)
-  wc = tf.expand_dims(wc, axis=-1)
-  wd = tf.expand_dims(wd, axis=-1)
-
-  out = wa*Ia + wb*Ib + wc*Ic + wd*Id
-  return out
 
 def computeHomography(r, t, d, ks=1):
   global f, px, py, ref_r, ref_t
@@ -268,7 +161,7 @@ def computeHomography(r, t, d, ks=1):
 
   return tf.matmul(tf.matmul(k, Ha + Hb / (-d-Hc)), ki)
 
-def samplePlane(plane, r, t, d, ks=1):
+def samplePlane(plane, r, t, d,theta, ks=1):
   global w, h, offset
   nh = h + offset * 2
   nw = w + offset * 2
@@ -278,7 +171,16 @@ def samplePlane(plane, r, t, d, ks=1):
   x, y = tf.meshgrid(list(range(w)), list(range(h)))
   x = tf.cast(x, tf.float32)
   y = tf.cast(y, tf.float32)
+
   coords = tf.stack([x, y, tf.ones_like(x)], 2)
+  mapping = tf.constant([[2/w, 0.0, -1.0],[0.0, 2/h, -1.0],[0.0,0.0,1.0]])
+  #with tf.compat.v1.variable_scope("foo", reuse=tf.compat.v1.AUTO_REUSE):
+    #  sx = tf.get_variable("sx", initializer=2.0, trainable=True)
+     # sy = tf.get_variable("sy", initializer=1.1, trainable=True)
+      #theta = tf.stack([tf.stack([sx,0.0,0.0]),tf.stack([0.0,sy,0.0]),tf.stack([0.0,0.0,1.0])])
+  #theta = tf.constant([[1.5,0,0],[0,1.0,0],[0,0,1]])
+  #thetap = tf.matmul(tf.linalg.inv(mapping),tf.matmul(theta,mapping))
+  #coords = tf.matmul(coords,tf.transpose(thetap))
   newCoords = tf.matmul(coords, tf.transpose(H))
 
   cx = tf.expand_dims(newCoords[:, :, 0] / newCoords[:, :, 2], 0)
@@ -303,14 +205,11 @@ def sampleDepth(latent,d):
     mv[3,3] =1
     mvi= np.linalg.inv(mv)
     ncoords = np.matmul(mvi,np.matmul(ki,coords))[:,:,:,0]
-    #print(d,ncoords)
-    #exit()
-    #ncoords = tf.convert_to_tensor(ncoords,dtype=tf.float32)
+
     cx = (ncoords[:, :, 0]-ccx+dx)/dx/2
     cy = (ncoords[:, :, 1]-ccy+dy)/dy/2
     cz = (ncoords[:, :, 2]-ccz+dz)/dz/2
-    #upb = tf.constant(1.1,dtype=tf.float32)
-    #p1 = nearest3d_sampler(latent, cx, cy, cz)
+
     p1 = linear3d_sampler(latent, cx, cy, cz)
     tf.add_to_collection("checkpoints", p1)
     b =tf.cast(tf.greater(cx,-0.1),tf.float32)*tf.cast(tf.greater(cy,-0.1),tf.float32)*tf.cast(tf.greater(cz,-0.1),tf.float32)
@@ -356,61 +255,99 @@ def testplot( a=0):
 
 def getPlanes():
   if FLAGS.invz:
-    return 1/np.linspace(1, 0.0001, num_mpi) * dmin
+    return 1/np.linspace(1, 0.0001, num_mpi*reuse_fac) * dmin
   else:
-    return np.linspace(dmin, dmax, num_mpi)
+    return np.linspace(dmin, dmax, num_mpi*reuse_fac)
 
 def network(mpi, latent, bg, features, is_training):
   alpha = 1
   output = 0.0
   mask = 0.0
   imgs = []
+  sublayers = []
   planes = getPlanes()
   rplanes = np.concatenate([planes, 2*planes[-1:]-planes[-2:-1]])
+  theta1 = tf.constant([[1.0,0,0],[0,1.0,0],[0,0,1]])
+  theta2 = tf.constant([[2.0,0,0],[0,1.0,0],[0,0,1]])
 
   for i, v in enumerate(planes):
       aa = 1
       out = 0
+      ls = []
       for j in range(sub_sam):
           vv = j/sub_sam
           dep = rplanes[i]*(1-vv) + rplanes[i+1]*(vv)
           depth = sampleDepth(latent,dep)
+          #dd  = samplePlane(depth,features["r"][0],features["t"][0], dep, theta1, 1)
+          #img = samplePlane(mpi[i],features["r"][0],features["t"][0], dep, theta2, 1)
+          #img = tf.concat([img,dd],-1)
           img = samplePlane(tf.concat([mpi[i], depth], -1),features["r"][0],features["t"][0], dep, 1)
           tf.add_to_collection("checkpoints", img)
           img = img[0]
           out += img[:,:,:4]*img[:,:,4:5]*aa
           aa  *= (1-img[:,:,4:5])
+          depth = tf.image.resize_images(depth, [int(h/8), int(w/8)], tf.image.ResizeMethod.AREA)
+          sublayers.append(depth)
           if j == 1:
               imgs.append(img)
       output += out[:,:,:3]*out[:,:,3:4]*alpha
       mask += out[:,:,3:4]*alpha
       alpha *= (1-out[:,:,3:4])
+
   output += (1-mask)*bg
-  return output, imgs
+  return output, imgs, sublayers
+
+def vq(img,table):
+    e_img = tf.expand_dims(img,-2)
+    _table = tf.reshape(table,[1,1,1,10,1])
+    dist = tf.abs(e_img-table)
+    dist = tf.reshape(dist,[num_mpi*reuse_fac*size_h*size_w,10])
+    k = tf.argmin(dist, axis=-1)
+    k = tf.reshape(k,[num_mpi*reuse_fac, size_h, size_w])
+    z_q = tf.gather(table, k)
+    return z_q
 
 def train():
     lod_in = tf.placeholder(tf.float32, shape=[], name='lod_in')
     features = load_data()
 
+    latent = np.random.uniform(-5,1,[laten_d, laten_h, laten_w, 1]).astype(np.float32)
+    mpi = np.random.uniform(-3,1,[num_mpi*reuse_fac, size_h, size_w, 4]).astype(np.float32)
+    mpi_c = np.random.uniform(-3,1,[num_mpi, size_h, size_w, 3]).astype(np.float32)
+    mpi_a = np.random.uniform(-3,1,[num_mpi*reuse_fac, size_h, size_w, 1]).astype(np.float32)
+    c_table = np.random.uniform(-3,1,[10,1]).astype(np.float32)
 
-    latent = np.random.uniform(-5,-0.1,[laten_d, laten_h, laten_w, 1]).astype(np.float32)
-    #latent = np.ones([laten_d, laten_h, laten_w, 1],dtype=np.float32)
-    mpi = np.random.uniform(-3,1,[num_mpi, size_h, size_w, 4]).astype(np.float32)
 
     bg = tf.get_variable("bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
+    c_noise = tf.constant(1.1)
+    #bg = bg + 0.5*c_noise*(2*tf.random_uniform(bg.shape)-1)* (1-lod_in/1200)
     bg = tf.sigmoid(bg)
     latent = tf.get_variable("depth", initializer=latent, trainable=True)
     latent = tf.sigmoid(latent)
+    c_table = tf.get_variable("lookup_table", initializer=c_table, trainable=True)
     #latent = tf.concat([tf.sigmoid(latent[:,:,:,:3]), tf.sigmoid(latent[:,:,:,3:]*3)],-1)
-    mpi = tf.get_variable("mpi", initializer=mpi, trainable=True)
-    noise = 2*tf.random_uniform(mpi.shape)-1
-    mpi = tf.sigmoid(mpi+noise*0.0)
+    if reuse_fac == 1 :
+        #mpi = tf.get_variable("mpi", initializer=mpi, trainable=True)
+        mpi_c = tf.get_variable("mpic", initializer=mpi_c, trainable=True)
+        mpi_aa = tf.get_variable("mpia", initializer=mpi_a, trainable=True)
+        mpi_a = mpi_aa#vq(mpi_aa,c_table)
+        #tf.add_to_collection("checkpoints", mpi_a)
+        mpi = tf.concat([mpi_c,mpi_a],-1)
+    else:
+        mpi_c = tf.get_variable("mpic", initializer=mpi_c, trainable=True)
+        mpi_c = tf.tile(mpi_c, [2, 1, 1, 1])
+        mpi_a = tf.get_variable("mpia", initializer=mpi_a, trainable=True)
+        mpi = tf.concat([mpi_c,mpi_a],-1)
+    noise = c_noise*(2*tf.random_uniform(mpi.shape)-1) * (1-lod_in/1200)
+    mpi = tf.sigmoid(mpi+noise)
     #mpia = tf.where(tf.random_uniform(mpi.shape) - mpip < 0, tf.ones_like(mpi), tf.zeros_like(mpi))
     #mpi = (mpip + mpia*3)/4
 
 
-    img_out, shifts = network(mpi, latent, bg, features, False)
+    img_out, shifts, sublayers = network(mpi, latent, bg, features, False)
     long = tf.concat(shifts, 1)
+    tvc = tf.constant(0.0001) #0.0005
+    tva = tf.constant(0.05) # 0.001
 
     with tf.compat.v1.variable_scope("loss"):
         mpiColor = mpi[:, :, :, :3]
@@ -418,18 +355,32 @@ def train():
         mask = tf.reduce_mean(features["img"][0],-1,keepdims=True)
         mask = tf.cast(tf.greater(mask,0.015),tf.float32)
         loss =  100000 * tf.reduce_mean(mask*tf.square(img_out - features["img"][0]))
-        #loss += 0.05 * tf.reduce_mean(tf.image.total_variation (mpiAlpha))
-        loss += 0.001 * tf.reduce_mean(tf.image.total_variation (mpiAlpha))
-        #loss += 0.0005 * tf.reduce_mean(tf.image.total_variation(mpiColor))
-        #loss += 0.0001 * tf.reduce_mean(tf.image.total_variation(mpiColor))
+        loss += tva * tf.reduce_mean(tf.image.total_variation (mpiAlpha))
+        loss += tvc * tf.reduce_mean(tf.image.total_variation(mpiColor))
+        #loss += 1 * tf.reduce_mean(tf.square(mpi_a*5 - tf.round(mpi_a*5) ))
+        loss += 10 * tf.reduce_mean(tf.square(tf.sigmoid(mpi_a) - tf.round(tf.sigmoid(mpi_a)) ))
+        #vq_loss = tf.reduce_mean(tf.squared_difference(tf.stop_gradient(mpi_aa), mpi_a) )
+        #dq_loss = 0.25*tf.reduce_mean(tf.squared_difference(tf.stop_gradient(mpi_a), mpi_aa) )
 
     #long = tf.concat(shifts, 1)
     img_out = tf.clip_by_value(img_out,0.0,1.0)
     long = tf.clip_by_value(long,0.0,1.0)
 
-    lr = 0.1
+    #lr = 0.1
+    lr = tf.compat.v1.train.exponential_decay(0.1,lod_in,100,0.5)
+    #optimizer = tf.train.GradientDescentOptimizer(lr)
+    t_vars = tf.trainable_variables()
+    c_vars = [var for var in t_vars if 'mpic' in var.name]
+    l_vars = [var for var in t_vars if 'lookup_table' in var.name]
+    #print("l_var",l_vars)
+    #l_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "mpia")
+    #print("l_var",l_vars)
+    nl_vars = [var for var in t_vars if 'lookup_table' not in var.name]
+    #look_grad = tf.gradients(vq_loss,l_vars)
+    #nlook_grad = tf.gradients(loss+dq_loss,nl_vars)
     optimizer = tf.train.AdamOptimizer(lr)
     train_op = slim.learning.create_train_op(loss,optimizer)
+    train_op2 = slim.learning.create_train_op(loss,optimizer,variables_to_train=c_vars)
 
     config = ConfigProto()
     config.gpu_options.allow_growth = True
@@ -445,6 +396,7 @@ def train():
     summary = tf.compat.v1.summary.merge([
                     tf.compat.v1.summary.scalar("all_loss", loss),
                     tf.compat.v1.summary.image("out",tf.expand_dims(img_out,0)),
+                    tf.compat.v1.summary.image("mpi_texture",mpi[2:3,:,:,:3]),
                     tf.compat.v1.summary.image("alpha",tf.expand_dims(long[:,:,3:4],0)),
                     tf.compat.v1.summary.image("color",tf.expand_dims(long[:,:,:3],0)),
                     tf.compat.v1.summary.image("depth",tf.expand_dims(long[:,:,4:5],0)),
@@ -454,15 +406,28 @@ def train():
     if not os.path.exists('./model/' + FLAGS.dataset +'/'+ FLAGS.input):
         os.makedirs('./model/' + FLAGS.dataset +'/'+ FLAGS.input)
     for i in range(FLAGS.epoch+3):
-        _,los = sess.run([train_op,loss])
-        if i%100==0:
+        if i<200:
+          _,los = sess.run([train_op,loss],feed_dict={lod_in:i})
+        else:
+          _,los = sess.run([train_op,loss],feed_dict={lod_in:i,tva:0.00001})
+        if i%50==0:
             print(i, "loss = " ,los)
         if i%20 == 0:
-           summ = sess.run(summary)
+           summ = sess.run(summary,feed_dict={lod_in:1200})
            writer.add_summary(summ,i)
         if i%200==0:
            saver.save(sess, './model/' + FLAGS.dataset +'/'+ FLAGS.input + '/' + str(i))
-
+    """
+    for i in range(203):
+        _,los = sess.run([train_op2,loss],feed_dict={c_noise:0.1,lod_in:500,tvc:0.00001,tva:0.})
+        if i%50==0:
+            print(FLAGS.epoch+i, "Extra loss = " ,los)
+        if i%20 == 0:
+           summ = sess.run(summary,feed_dict={lod_in:1200})
+           writer.add_summary(summ,FLAGS.epoch+i)
+        if i%200==0:
+           saver.save(sess, './model/' + FLAGS.dataset +'/'+ FLAGS.input + '/' + str(FLAGS.epoch+i))
+    """
 
 def predict():
     global w, h, offset, f
@@ -483,6 +448,10 @@ def predict():
     testset = tf.data.TFRecordDataset(["datasets/" + FLAGS.dataset + "/" + FLAGS.input + ".test"])
     testset = testset.map(parser).repeat().batch(1).make_one_shot_iterator()
     features = testset.get_next()
+    #features = {}
+    #features["r"] = tf.convert_to_tensor(np.array([ref_r]))
+    #features["t"] = tf.convert_to_tensor(np.array([ref_t]))
+    #features = tf.convert_to_tensor(features)
 
 
     latent = np.zeros([laten_d, laten_h, laten_w, 1],dtype=np.float32)
@@ -492,21 +461,37 @@ def predict():
         ch, cw = int(laten_h/2-i/2), int(laten_w/2-i/4)
         latent[i,ch-10:ch+10,cw-5:cw+5,0] = 1.0
 
-    mpi = np.zeros([num_mpi,  size_h, size_w, 4],dtype=np.float32)
+    mpi = np.zeros([num_mpi*reuse_fac,  size_h, size_w, 4],dtype=np.float32)
     mpi[0] = [1.,0.,0.,.95]
     mpi[1] = [1.,.5,0.,.95]
     mpi[2] = [1.,1.,0.,.95]
     mpi[3] = [.5,1.,0.,.95]
 
+    mpi_c = np.random.uniform(-3,1,[num_mpi, size_h, size_w, 3]).astype(np.float32)
+    mpi_a = np.random.uniform(-3,1,[num_mpi*reuse_fac, size_h, size_w, 1]).astype(np.float32)
+
     bg = tf.get_variable("bg", initializer=np.array([5,5,5],dtype=np.float32), trainable=True)
     bg = tf.sigmoid(bg)
     latent = tf.get_variable("depth", initializer=latent, trainable=False)
     latent = tf.sigmoid(latent)
-    mpi = tf.get_variable("mpi", initializer=mpi, trainable=True)
+    if (reuse_fac == 1):
+        #mpi = tf.get_variable("mpi", initializer=mpi, trainable=True)
+        mpi_c = tf.get_variable("mpic", initializer=mpi_c, trainable=True)
+        mpi_a = tf.get_variable("mpia", initializer=mpi_a, trainable=True)
+        #mpi_a = tf.round(mpi_a)
+        #mpi_a = tf.where(tf.greater(mpi_a,0.5),5.*tf.ones_like(mpi_a),0.*tf.ones_like(mpi_a)) + tf.where(tf.greater(mpi_a,-1.5),0.*tf.ones_like(mpi_a),-5.*tf.ones_like(mpi_a))
+        mpi = tf.concat([mpi_c,mpi_a],-1)
+    else:
+        mpi_c = tf.get_variable("mpic", initializer=mpi_c, trainable=True)
+        mpi_c = tf.tile(mpi_c, [2, 1, 1, 1])
+        mpi_a = tf.get_variable("mpia", initializer=mpi_a, trainable=True)
+        mpi = tf.concat([mpi_c,mpi_a],-1)
     mpi = tf.sigmoid(mpi)
 
 
-    img_out, shifts = network(mpi, latent, bg, features, False)
+
+
+    img_out, shifts, sss = network(mpi, latent, bg, features, False)
 
     long = tf.concat(shifts, 1)
     img_out = tf.clip_by_value(img_out,0.0,1.0)
@@ -527,11 +512,12 @@ def predict():
         #print(bug.shape)
         #out, bug = sess.run([img_out,latent])
         #print(bug.shape)
-        plt.imshow(bug[:,:,:3])
-        tt = np.concatenate([bug[1,:,:,0],bug[20,:,:,0],bug[40,:,:,0],bug[59,:,:,0]],1)
-        plt.matshow(tt,cmap='gray')
+        #plt.imshow(bug[:,:,:3])
+        #tt = np.concatenate([bug[1,:,:,0],bug[20,:,:,0],bug[40,:,:,0],bug[59,:,:,0]],1)
+        #plt.matshow(tt,cmap='gray')
         #plt.imshow(out)
-        plt.show()
+        #plt.show()
+        print("!!")
     else:
         #ff = sess.run(features)
         #print(fff)
@@ -546,13 +532,50 @@ def predict():
             #plt.imsave("result/%04d.png"%(i),bug[:,:,:3])
             plt.imsave("result/frame/%04d.png"%(i),out)
 
-        cmd = 'ffmpeg -y -i ' + 'result/frame/\%04d.png -c:v libx264 -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" -pix_fmt yuv420p result/' +FLAGS.input+ '.mp4'
+        cmd = 'ffmpeg -y -i ' + 'result/frame/\%04d.png -c:v libx264 -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" -pix_fmt yuv420p result/' +FLAGS.input+FLAGS.version+ '.mp4'
         print(cmd)
         os.system(cmd)
 
-    #out, bug = sess.run([img_out,debug])
-    #plt.imshow(out)
-    #plt.show()
+    if True:
+      webpath = "/var/www/html/orbiter/"
+      if not os.path.exists(webpath + FLAGS.input+FLAGS.version):
+          os.system("mkdir " + webpath + FLAGS.input+FLAGS.version)
+
+      ret, sublay = sess.run([mpi,sss],feed_dict={features['r']:np.array([ref_r]),features['t']:np.array([ref_t])})
+      sublayers = []
+      mpis = []
+      sublayers_combined = []
+      print("sublay",sublay[0].shape,len(sublay))
+      for i in range(num_mpi*reuse_fac):
+          mpis.append(ret[i,:,:,:4])
+          ls = []
+          for j in range(sub_sam):
+              ls.append(sublay[sub_sam*i+j])
+          ls = np.concatenate(ls,0)
+          #ls = np.expand_dims(ls,-1)
+          ls = np.tile(ls,(1,1,3))
+          sublayers.append(ls)
+          ls = np.reshape(ls, (sub_sam,sublay[0].shape[0],sublay[0].shape[1],3))
+          ls = np.clip(np.sum(ls, 0), 0.0, 1.0)
+          sublayers_combined.append(ls)
+          #out = np.rot90(out,1)
+
+      mpis = np.concatenate(mpis, 1)
+      plt.imsave(webpath + FLAGS.input+FLAGS.version + "/mpi.png", mpis)
+      plt.imsave(webpath + FLAGS.input+FLAGS.version + "/mpi_alpha.png", np.tile(mpis[:, :, 3:], (1, 1, 3)))
+      sublayers = np.concatenate(sublayers, 1)
+      sublayers = np.clip(sublayers, 0, 1)
+      plt.imsave(webpath + FLAGS.input+FLAGS.version + "/sublayer.png", sublayers)
+      sublayers_combined = np.concatenate(sublayers_combined, 1)
+      plt.imsave(webpath + FLAGS.input+FLAGS.version + "/sublayers_combined.png", sublayers_combined)
+
+      with open(webpath + FLAGS.input+FLAGS.version + "/extrinsics.txt", "w") as fo:
+        for i in range(3):
+          for j in range(3):
+            fo.write(str(ref_r[i, j]) + " ")
+        fo.write(" ".join([str(x) for x in np.nditer(ref_t)]) + "\n")
+
+      generateWebGL(webpath + FLAGS.input+FLAGS.version + "/index.html", w, h, getPlanes(),sub_sam, f, px, py)
 
 
 

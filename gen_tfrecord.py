@@ -1,15 +1,17 @@
 import numpy as np
 import os
 import tensorflow as tf
+import cv2 as cv
 import glob
 import json
 import matplotlib.pyplot as plt
 #from mpl_toolkits.mplot3d import Axes3D
 import math
 from utils import findCameraSfm, findExrs
+from multiprocessing import Pool
 
 FLAGS = tf.app.flags.FLAGS
-tf.app.flags.DEFINE_string("dataset", "temple1", "input_dataset")
+tf.app.flags.DEFINE_string("dataset", "penguin", "input_dataset")
 tf.app.flags.DEFINE_string("output", "tem", "outcome_name")
 
 tf.app.flags.DEFINE_boolean("skipexr", False, "skip_to_convert_exr_file")
@@ -25,7 +27,7 @@ tf.app.flags.DEFINE_integer("index", 1, "index of reference image such that MPI 
 #ref_img = ["354632085", "1221962097", "1004312245", "1902466051", "164864196"]
 
 _EPS = np.finfo(float).eps * 4.0
-#index = FLAGS.index
+index = FLAGS.index
 ref_t = 0
 #cx = cy =0
 cx = -0.40782
@@ -65,17 +67,98 @@ def readCamera():
 
   return cams
 
+def petCon(ff):
+     path = "datasets/" + FLAGS.dataset + "/undistorted"
+     f, camn = ff
+     #print(f)
+     os.system("convert " + f + " " + path + "/" + camn + "png")
+     print(camn+'png')
+
+def petCon2(ff):
+     path = "datasets/" + FLAGS.dataset + "/undistorted"
+     f, camn = ff
+     #print(f)
+     os.system("cp " + f + " " + path + "/" + camn + "png")
+     print(camn+'png')
+
+def wBalance(each):
+    theta = np.array([ 0.92061483, -0.05679812,  0.12718477, 0.0,
+        0.28299711,  0.9939925 ,  0.43755023, 0.0,
+       -0.24056293,  0.00587971,  0.74546691, 0.0,
+       -3.13413501,  0.839871  , -5.55257329, 1.0]).reshape((4,4))
+    path = "datasets/" + FLAGS.dataset + "/undistorted/"
+    img = cv.imread(path+each)
+    img = cv.cvtColor(img, cv.COLOR_BGR2RGB)
+    w = img.shape[0]
+    h = img.shape[1]
+    a1 = np.ones((w*h,4))
+    a1[:,:3]= img.reshape((w*h,3))
+    out = np.matmul(a1,theta)
+    out = out[:,:3].reshape((w,h,3))
+    out = np.clip(out, 0, 255)
+    out = np.uint8(out)
+    out = cv.cvtColor(out, cv.COLOR_RGB2BGR)
+    path = "datasets/" + FLAGS.dataset + "/recolored/"
+    cv.imwrite(path+each,out)
+    print("color ",each)
+
+def segment(obj):
+    num_pos, num_cam, dataset = obj
+    im1 = cv.imread("datasets/" + dataset + "/recolored/cam%03d_%05d.png"%(num_cam,(num_pos-0)%40))/255
+    img = 0.0
+    for k in range(3,4):
+        if(num_pos+k<=40):
+            im0 = cv.imread("datasets/" + dataset + "/recolored/cam%03d_%05d.png"%(num_cam,(num_pos+k)%40))/255
+            img = img*0.5+0.5*(np.linalg.norm(im1 - im0, axis=-1, keepdims=True)>20/255)*1.0
+        if(num_pos-k>=0):
+            im0 = cv.imread("datasets/" + dataset + "/recolored/cam%03d_%05d.png"%(num_cam,(num_pos-k)%40))/255
+            img = img*0.5+0.5*(np.linalg.norm(im1 - im0, axis=-1, keepdims=True)>20/255)*1.0
+    
+    kernel = np.ones((5,5),np.uint8)
+    img = cv.dilate(img, kernel, iterations=9)
+    img = img**0.30
+    img = np.round(img)
+    img = cv.blur(img,(55,55))
+    img = np.expand_dims(img,-1)
+    bg = np.sum(im1*(1-img),axis=(0,1))/np.sum((1-img),axis=(0,1))
+    #bg = np.array([255,0,0])
+    img = im1*img + bg*(1-img)
+
+    cv.imwrite("datasets/" + dataset + "/segm/cam%03d_%05d.png"%(num_cam,(num_pos-k)%40),img*255)
+    print("segm cam%03d_%05d."%(num_cam,(num_pos)%40))
+
 def convertExr(cams):
+  print("HuKi !!!")
   path = "datasets/" + FLAGS.dataset + "/undistorted"
   if not os.path.exists(path):
     os.mkdir(path)
 
   folder = findExrs(FLAGS.dataset)
-  for f in glob.glob(folder + "/*.exr"):
+  ll = []
+  for f in glob.glob(folder + "/*.png"):
     imgname = f.split("/")[-1][:-4]
-    if imgname not in cams or os.path.exists(path + "/" + cams[imgname]["filename"]): continue
-    os.system("convert " + f + " " + path + "/" + cams[imgname]["filename"][:-3] + "png")
-    print(cams[imgname]["filename"])
+    if imgname not in cams or os.path.exists(path + "/" + cams[imgname]["filename"]): pass
+    else:
+      ll.append((f,cams[imgname]["filename"][:-3]))
+
+  p = Pool(12)
+  p.map(petCon2,ll)
+  """
+  path2 = "datasets/" + FLAGS.dataset + "/recolored"
+  if not os.path.exists(path2):
+    os.mkdir(path2)
+    p.map(wBalance,os.listdir(path))
+
+  path2 = "datasets/" + FLAGS.dataset + "/segm"
+  if not os.path.exists(path2):
+    os.mkdir(path2)
+    ll = []
+    for i in range(41):
+      for j in range(10):
+        ll.append((i,j,FLAGS.dataset))
+        #segment((i,j,FLAGS.dataset))
+    p.map(segment,ll)
+    """
   return path
 
 def quaternion_from_matrix(matrix):
@@ -170,15 +253,17 @@ def generate():
     scams = sorted(cams.items(), key=lambda x: x[1]["filename"])
     #dcams = sorted(cams.items(), key=lambda x: x[1]["angle"])
     imgFolder = "datasets/" + FLAGS.dataset + "/undistorted" if FLAGS.skipexr else convertExr(cams)
+    #imgFolder = "datasets/" + FLAGS.dataset + "/recolored" if FLAGS.skipexr else convertExr(cams)
+    #imgFolder = "datasets/" + FLAGS.dataset + "/segm" if FLAGS.skipexr else convertExr(cams)
     with tf.io.TFRecordWriter("datasets/" + FLAGS.dataset + "/" + FLAGS.output +".train") as tfrecord_writer:
       with tf.Session() as sess:
-        px, py = [], []
-        for i in range(25):
-            print(i,scams[i][1]["filename"])
-            #if dcams[i][1]["angle"]>cams[ref_img[index+1]]["angle"]:
-            #    break
-            #if dcams[i][1]["angle"]>cams[ref_img[index]]["angle"] and dcams[i][1]["dis"]>4.0:
-            if(1):
+        #px, py = [], []
+        for i in range(410):
+            i_pose = (i%41)
+            i_cam = int(i/41)
+            dis_cyc = min((i_pose-index*4-2)%40,(index*4+2-i_pose)%40)
+            if(i_cam<3 and dis_cyc<4 ):
+                print(i,i_cam,i_pose,scams[i][1]["filename"])
                 try:
                     image_path = imgFolder + "/" + scams[i][1]["filename"]
                     width, height = imagesize.get(image_path)
@@ -194,6 +279,9 @@ def generate():
                         'w': _int64_feature(width),
                       }))
                     tfrecord_writer.write(example.SerializeToString())
+                    if(i_pose == 0 and dis_cyc<3):
+                      tfrecord_writer.write(example.SerializeToString())
+                      tfrecord_writer.write(example.SerializeToString())
                     #px.append(dcams[i][1]["c"][1])
                     #py.append(dcams[i][1]["c"][2])
                 except:
@@ -203,8 +291,8 @@ def generate():
     #plt.show()
     #scams = sorted(dcams[:30], key=lambda x: x[1]["filename"])
     with tf.io.TFRecordWriter("datasets/" + FLAGS.dataset + "/" + FLAGS.output + ".test") as tfrecord_writer:
-        dirt = [15, 19, 3, 0]
-        n = 100
+        dirt = [41*(0)+index*4, 41*(0)+index*4+1, 41*(0)+index*4+2, 41*(0)+index*4+3, 41*(0)+index*4+4]
+        n = 75
         m = len(dirt)-1
         #print(scams[FLAGS.start][1]["filename"])
         #print(scams[FLAGS.end][1]["filename"])
@@ -214,6 +302,7 @@ def generate():
             for j in range(n):
                   tt = (j+0.5) / n # avoid the train image, especially the ref image
                   rot = interpolate_rotation(scams[dirt[i]][1]["r"], scams[dirt[i+1]][1]["r"], tt)
+                  #rot = scams[dirt[i]][1]["r"] * (1-tt) + scams[dirt[i+1]][1]["r"] * tt
                   t = scams[dirt[i]][1]["t"] * (1-tt) + scams[dirt[i+1]][1]["t"] * tt
                   #rot = interpolate_rotation(cams[ref_img[index]]["r"], cams[ref_img[index+1]]["r"], tt)
                   #t = cams[ref_img[index]]["t"] * (1-tt) + cams[ref_img[index+1]]["t"] * tt
