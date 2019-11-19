@@ -14,8 +14,8 @@ from view_gen import generateWebGL
 from utils import *
 from localpath import getLocalPath
 
-import memory_saving_gradients
-tf.__dict__["gradients"] = memory_saving_gradients.gradients_collection
+#import memory_saving_gradients
+#tf.__dict__["gradients"] = memory_saving_gradients.gradients_collection
 #from gen_tfrecord import findCameraSfm
 
 slim = tf.contrib.slim
@@ -25,6 +25,7 @@ tf.app.flags.DEFINE_boolean("invz", False, "using inverse depth, ignore dmax in 
 tf.app.flags.DEFINE_boolean("predict", False, "making a video")
 tf.app.flags.DEFINE_boolean("FromFuture", False, "making a video")
 tf.app.flags.DEFINE_float("scale", 0.75, "scale input image by")
+tf.app.flags.DEFINE_integer("subscale", 8, "downscale factor for the sub layer")
 
 tf.app.flags.DEFINE_integer("layers", 25, "number of planes")
 tf.app.flags.DEFINE_integer("sublayers", 2, "number of sub planes")
@@ -42,14 +43,14 @@ if FLAGS.dataset == "temple0":
     ref_ID = ["354632085", "1221962097", "1004312245", "1902466051", "164864196", "949584407", "496808732", "228538494","354632085"]
 elif FLAGS.dataset == "lib2":
     ref_img = ["2_00000","2_00004","2_00008","2_00012","2_00016","2_00000"]
-elif FLAGS.dataset in ["toro", "acup8", "acup9"] :
+elif FLAGS.dataset == "toro" :
     ref_img = ["2_00000","2_00004","2_00008","2_00012","2_00016","2_00020","2_00024","2_00028","2_00032","2_00036","2_00000"]
-elif FLAGS.dataset in ["penguin2","acup10","acup11"] :
+elif FLAGS.dataset in ["acup11"] :
     ref_img = ["4_00000","4_00004","4_00008","4_00012","4_00016","4_00020","4_00024","4_00028","4_00032","4_00036","4_00000"]
 elif FLAGS.dataset in ["acup7", "acup6","toro2","dumdum"]:
     ref_img = ["0_00000","0_00004","0_00008","0_00012","0_00016","0_00020","0_00024","0_00028","0_00032","0_00036","0_00000"]
 else:
-    print("error: dataset is unknown")
+    print("error: dataset not found")
     exit()
 mpi_max = len(ref_img)-1
 
@@ -214,7 +215,7 @@ def getPlanes(index):
   else:
     return np.linspace(dmin, dmax, num_mpi)
 
-def network(mpi, latent,bg, rot,tra, index, is_training):
+def network(mpi, depth, bg, rot,tra, index, is_training):
   alpha = 1
   output = 0
   mask = 0.0
@@ -229,15 +230,16 @@ def network(mpi, latent,bg, rot,tra, index, is_training):
       for j in range(sub_sam):
           vv = j/sub_sam
           dep = rplanes[i]*(1-vv) + rplanes[i+1]*(vv)
-          depth = sampleDepth(latent,dep, index)
-          img = samplePlane(tf.concat([mpi[i], depth], -1),rot,tra, dep, 1,index)
+          #depth = sampleDepth(latent,dep, index)
+          depth_map = depth[i,:,:,j:j+1]
+          img = samplePlane(tf.concat([mpi[i], depth_map], -1),rot,tra, dep, 1,index)
           tf.add_to_collection("checkpoints", img)
           img = img[0]
           out += img[:,:,:4]*img[:,:,4:5]*aa
           aa  *= (1-img[:,:,4:5])
-          depth = tf.image.resize_images(depth, [int(h/8), int(w/8)], tf.image.ResizeMethod.AREA)
-          sublayers.append(depth)
-          if j == 1:
+          depth_map = tf.image.resize_images(depth_map, [int(h/8), int(w/8)], tf.image.ResizeMethod.AREA)
+          sublayers.append(depth_map)
+          if j == 0:
               imgs.append(img)
       output += out[:,:,:3]*out[:,:,3:4]*alpha
       alpha *= (1-out[:,:,3:4])
@@ -252,18 +254,25 @@ def train():
     tra = tf.placeholder(tf.float32, shape=[3,1], name='translation')
     real_img = tf.placeholder(tf.float32, shape=[h,w,3], name='ex_img')
 
-    latent = np.random.uniform(-5,0,[laten_d, laten_h, laten_w, 1]).astype(np.float32)
     int_mpi1 = np.random.uniform(-1, 0,[num_mpi, h, w, 3]).astype(np.float32)
-    int_mpi2 = np.random.uniform(-2, 0,[num_mpi, h, w, 1]).astype(np.float32)
+    int_mpi2 = np.random.uniform(-5,-1,[num_mpi, h, w, 1]).astype(np.float32)
     int_mpi = np.concatenate([int_mpi1,int_mpi2],-1)
 
-    backup = tf.get_variable("Net_backup", initializer=latent, trainable=False)
-    latent = tf.get_variable("Net_depth", initializer=latent, trainable=True)
-    latent = tf.sigmoid(latent)
+
+    depth_init = np.random.uniform(-5,0,[num_mpi, int(h/ FLAGS.subscale), int(w/ FLAGS.subscale), sub_sam]).astype(np.float32)
+    #depth_init = np.random.uniform(-5, 0, [FLAGS.layers, int(nh / FLAGS.subscale), int(nw / FLAGS.subscale), FLAGS.sublayers]).astype(np.float32)
+
+    #backup = tf.get_variable("Net_backup", initializer=depth_init, trainable=False)
+    if(FLAGS.sublayers<=1):
+      depth = tf.get_variable("Net_depth", initializer=depth_init*0+1, trainable=False)
+    else:
+      depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
+    depth = tf.sigmoid(depth)
+    depth = tf.image.resize(depth, [h, w], align_corners=True)
 
     bg = tf.get_variable("Net_bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
     bgup = tf.get_variable("Net_backupbg", initializer=np.array([1,1,1],dtype=np.float32), trainable=False)
-    #noise = 0.05*(2*tf.random_uniform(bg.shape)-1) * (1-lod_in/2200)
+    #noise = 0.15*(2*tf.random_uniform(bg.shape)-1) * (1-lod_in/2200)
     bg = tf.sigmoid(bg)
 
     mpis = []
@@ -282,7 +291,7 @@ def train():
             mpi = tf.get_variable("mpi", initializer=int_mpi, trainable=True)
             mpi = tf.sigmoid(mpi)
             mpis.append(mpi)
-            img_out, shifts, sss = network(mpis[i], latent, bg, rot,tra,(FLAGS.index+i)%mpi_max, False)
+            img_out, shifts, sss = network(mpis[i], depth, bg, rot,tra,(FLAGS.index+i)%mpi_max, False)
             long = tf.concat(shifts, 1)
 
         with tf.compat.v1.variable_scope("loss%d"%((FLAGS.index+i)%mpi_max)):
@@ -304,17 +313,17 @@ def train():
                             tf.compat.v1.summary.scalar("all_loss", losses[i]),
                             tf.compat.v1.summary.image("out",tf.expand_dims(image_out[i],0)),
                             tf.compat.v1.summary.image("origi",tf.expand_dims(real_img,0)),
-                            tf.compat.v1.summary.image("alpha",tf.expand_dims(longs[i][:,:,4:5],0)),
-                            tf.compat.v1.summary.image("color",tf.expand_dims(longs[i][:,:,:3]*longs[i][:,:,4:5],0)),
+                            tf.compat.v1.summary.image("alpha",tf.expand_dims(longs[i][:,:,3:4],0)),
+                            tf.compat.v1.summary.image("color",tf.expand_dims(longs[i][:,:,:3]*longs[i][:,:,3:4],0)),
                             ])
             summaries.append(summary)
 
-    netb = tf.contrib.framework.get_variables_by_name("Net_backup")
-    netb.append(tf.contrib.framework.get_variables_by_name("Net_backupbg")[0])
-    netd = tf.contrib.framework.get_variables_by_name("Net_depth")
-    netd.append(tf.contrib.framework.get_variables_by_name("Net_bg")[0])
-    backup = [v.assign(netd[i]) for i, v in enumerate(netb)]
-    loadup = [v.assign(netd[i]*0.5+netb[i]*0.5) for i, v in enumerate(netd)]
+    #netb = tf.contrib.framework.get_variables_by_name("Net_backup")
+    #netb.append(tf.contrib.framework.get_variables_by_name("Net_backupbg")[0])
+    #netd = tf.contrib.framework.get_variables_by_name("Net_depth")
+    #netd.append(tf.contrib.framework.get_variables_by_name("Net_bg")[0])
+    #backup = [v.assign(netd[i]) for i, v in enumerate(netb)]
+    #loadup = [v.assign(netd[i]*0.5+netb[i]*0.5) for i, v in enumerate(netd)]
     
     config = ConfigProto()
     config.gpu_options.allow_growth = True
@@ -360,19 +369,20 @@ def train():
         if (FLAGS.index==0 and i_mpi==0): FLAGS.epoch = int(FLAGS.epoch*1.5)
         if (FLAGS.index==0 and i_mpi==1): FLAGS.epoch = int(FLAGS.epoch/1.5)
         for i in range(FLAGS.epoch + 3):
+
             feed = sess.run(features)
             lodin = int(FLAGS.index/mpi_max)*int(FLAGS.epoch/2)
-            if (i_mpi==0 and i<2000):
+            if (i_mpi==0 and i<2500):
                 _,los = sess.run([train_ops[i_mpi],losses[i_mpi]],feed_dict={lod_in:lodin+i,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
             elif(i_mpi==0 and FLAGS.epoch - i < 0):
-                _,los = sess.run([train_ops[i_mpi],losses[i_mpi]],feed_dict={lod_in:lodin+i,tvc:0.0005,rot:feed0["r"][0],tra:feed0["t"][0],real_img:feed0["img"][0]})
+                _,los = sess.run([train_ops[i_mpi],losses[i_mpi]],feed_dict={lod_in:lodin+i,tva:0.00001,rot:feed0["r"][0],tra:feed0["t"][0],real_img:feed0["img"][0]})
             else:
-                _,los = sess.run([train_ops[i_mpi],losses[i_mpi]],feed_dict={lod_in:lodin+i,tvc:0.001,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
+                _,los = sess.run([train_ops[i_mpi],losses[i_mpi]],feed_dict={lod_in:lodin+i,tva:0.001,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
 
             if i%100==0:
                 print(FLAGS.index,i_mpi,i, "loss = " ,los)
             if i%20 == 0:
-               if(FLAGS.index>mpi_max-8): sess.run(loadup)
+               #if(FLAGS.index>mpi_max-8): sess.run(loadup)
                if(FLAGS.epoch - i < 20):
                  summ = sess.run(summaries[i_mpi],feed_dict={lod_in:lodin+i,rot:feed0["r"][0],tra:feed0["t"][0],real_img:feed0["img"][0]})
                else:
@@ -381,7 +391,7 @@ def train():
                if(i_mpi==0 and FLAGS.index!=0): blank += FLAGS.epoch
                writer.add_summary(summ,blank+i)
             if i%200==1:
-               sess.run(backup)
+               #sess.run(backup)
                saver.save(sess, localpp + '/' + str(i))
 
 
@@ -411,12 +421,7 @@ def predict():
     bg = tf.get_variable("Net_bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
     bg = tf.sigmoid(bg)
 
-    latent = np.zeros([laten_d, laten_h, laten_w, 1],dtype=np.float32)
-
-    latent[-2:laten_d,:,:,0] = 0.5
-    for i in range(laten_d):
-        ch, cw = int(laten_h/2-i/2), int(laten_w/2-i/4)
-        latent[i,ch-10:ch+10,cw-5:cw+5,0] = 1.0
+    depth_init = np.random.uniform(-5,0,[num_mpi, int(h/ FLAGS.subscale), int(w/ FLAGS.subscale), sub_sam]).astype(np.float32)
 
     mpi = np.zeros([num_mpi, h, w, 4],dtype=np.float32)
     mpi[0] = [1.,0.,0.,.95]
@@ -424,8 +429,10 @@ def predict():
     mpi[2] = [1.,1.,0.,.95]
     mpi[3] = [.5,1.,0.,.95]
 
-    latent = tf.get_variable("Net_depth", initializer=latent, trainable=False)
-    latent = tf.sigmoid(latent)
+    depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
+    depth = tf.sigmoid(depth)
+    depth = tf.image.resize(depth, [h, w], align_corners=True)
+
     mpis = []
     image_out = []
     longs = []
@@ -437,7 +444,7 @@ def predict():
             mpi = tf.sigmoid(mpi)
             mpis.append(mpi)
 
-            img_out, shifts, sss = network(mpis[i], latent, bg, rot,tra,(FLAGS.index+i)%mpi_max, False)
+            img_out, shifts, sss = network(mpis[i], depth, bg, rot,tra,(FLAGS.index+i)%mpi_max, False)
             ssss.append(sss)
             long = tf.concat(shifts, 1)
 
@@ -493,8 +500,7 @@ def predict():
         os.system(cmd)
 
     if False:
-      #webpath = "/var/www/html/orbiter/"
-      webpath = "webpath/"
+      webpath = "/var/www/html/orbiter/"
       if not os.path.exists(webpath + FLAGS.dataset):
           os.system("mkdir " + webpath + FLAGS.dataset)
 

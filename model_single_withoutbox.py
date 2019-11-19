@@ -9,13 +9,14 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from tensorflow.compat.v1 import ConfigProto
 from mpl_toolkits.mplot3d import Axes3D
+import cv2
 
 from view_gen import generateWebGL
 from utils import *
 from localpath import getLocalPath
 
-import memory_saving_gradients
-tf.__dict__["gradients"] = memory_saving_gradients.gradients_collection
+#import memory_saving_gradients
+#tf.__dict__["gradients"] = memory_saving_gradients.gradients_collection
 #from gen_tfrecord import findCameraSfm
 
 slim = tf.contrib.slim
@@ -23,8 +24,9 @@ FLAGS = tf.app.flags.FLAGS
 
 tf.app.flags.DEFINE_boolean("invz", False, "using inverse depth, ignore dmax in this case")
 tf.app.flags.DEFINE_boolean("predict", False, "making a video")
-tf.app.flags.DEFINE_boolean("FromFuture", False, "making a video")
+tf.app.flags.DEFINE_boolean("endvdo", False, "making a last video frame")
 tf.app.flags.DEFINE_float("scale", 0.75, "scale input image by")
+tf.app.flags.DEFINE_integer("subscale", 8, "downscale factor for the sub layer")
 
 tf.app.flags.DEFINE_integer("layers", 25, "number of planes")
 tf.app.flags.DEFINE_integer("sublayers", 2, "number of sub planes")
@@ -34,7 +36,7 @@ tf.app.flags.DEFINE_integer("batch_size", 1, "Size of mini-batch.")
 tf.app.flags.DEFINE_integer("index", 0, "index number")
 
 tf.app.flags.DEFINE_string("dataset", "temple0", "which dataset in the datasets folder")
-tf.app.flags.DEFINE_string("input", "tem0", "input tfrecord")
+tf.app.flags.DEFINE_string("input", "cen0", "input tfrecord")
 
 #tf.app.flags.DEFINE_string("ref_img", "0051.png", "reference image such that MPI is perfectly parallel to")
 if FLAGS.dataset == "temple0":
@@ -42,14 +44,14 @@ if FLAGS.dataset == "temple0":
     ref_ID = ["354632085", "1221962097", "1004312245", "1902466051", "164864196", "949584407", "496808732", "228538494","354632085"]
 elif FLAGS.dataset == "lib2":
     ref_img = ["2_00000","2_00004","2_00008","2_00012","2_00016","2_00000"]
-elif FLAGS.dataset in ["toro", "acup8", "acup9"] :
-    ref_img = ["2_00000","2_00004","2_00008","2_00012","2_00016","2_00020","2_00024","2_00028","2_00032","2_00036","2_00000"]
-elif FLAGS.dataset in ["penguin2","acup10","acup11"] :
+elif FLAGS.dataset in ["acup11"]:
     ref_img = ["4_00000","4_00004","4_00008","4_00012","4_00016","4_00020","4_00024","4_00028","4_00032","4_00036","4_00000"]
+elif FLAGS.dataset == "toro" :
+    ref_img = ["2_00000","2_00004","2_00008","2_00012","2_00016","2_00020","2_00024","2_00028","2_00032","2_00036","2_00000"]
 elif FLAGS.dataset in ["acup7", "acup6","toro2","dumdum"]:
     ref_img = ["0_00000","0_00004","0_00008","0_00012","0_00016","0_00020","0_00024","0_00028","0_00032","0_00036","0_00000"]
 else:
-    print("error: dataset is unknown")
+    print("error: dataset not found")
     exit()
 mpi_max = len(ref_img)-1
 
@@ -82,7 +84,7 @@ def load_data(i,is_shuff=False):
 
     fs["img"] = tf.to_float(tf.image.decode_png(fs["img"], 3)) / 255.0
     if FLAGS.scale < 1:
-      fs["img"] = tf.image.resize_images(fs["img"], [h, w], tf.image.ResizeMethod.AREA)
+      fs["img"] = tf.image.resize(fs["img"], [h, w], tf.image.ResizeMethod.AREA)
 
     fs["r"] = tf.reshape(fs["r"], [3, 3])
     fs["t"] = tf.reshape(fs["t"], [3, 1])
@@ -90,7 +92,7 @@ def load_data(i,is_shuff=False):
 
   # np.random.shuffle(filenames)
   #localpp = getLocalPath("/home2/suttisak","datasets/" + FLAGS.dataset + "/tem" + str(FLAGS.index%mpi_max) + ".train")
-  localpp = "datasets/" + FLAGS.dataset + "/tem" + str(FLAGS.index%mpi_max) + ".train"
+  localpp = "datasets/" + FLAGS.dataset + "/" + FLAGS.input + ".train"
   dataset = tf.data.TFRecordDataset([localpp])
   dataset = dataset.map(parser)
   if(is_shuff):  dataset = dataset.shuffle(5)
@@ -174,47 +176,19 @@ def samplePlane(plane, r, t, d, ks=1,index=0):
 
   return bilinear_sampler(plane, cx + offset, cy + offset)
 
-def sampleDepth(latent,d,index):
-    global f, px, py, ref_r, ref_t, w, h
-    x, y = np.meshgrid(np.linspace(-1,1,w), np.linspace(-1,1,h))
-    wan = np.ones_like(x)
-
-    coords = np.stack([x*d, y*d, wan*d, wan], -1).reshape(h,w,4,1) #(h,w,4)
-    k = [[2*f/w, 0      , 2*px/w-1  , 0],
-         [0    , 2*f/h ,  2*py/h-1 , 0],
-         [0    , 0      , 1         , 0],
-         [0    , 0      , 0         , 1]]
-    ki = np.linalg.inv(k)
-    mv = np.zeros([4,4])
-    mv[:3,:3] = ref_r[index]
-    for i in range(3): mv[i,3] = ref_t[index][i]
-    mv[3,3] = 1
-    mvi= np.linalg.inv(mv)
-    #cam coordinate to world coordinate
-    ncoords = np.matmul(mvi,np.matmul(ki,coords))[:,:,:,0]
-    
-    #world coordinate to box coordinate
-    cx = (ncoords[:, :, 0]-ccx+dx)/dx/2
-    cy = (ncoords[:, :, 1]-ccy+dy)/dy/2
-    cz = (ncoords[:, :, 2]-ccz+dz)/dz/2
-    
-    p1 = linear3d_sampler(latent, cx, cy, cz)
-    tf.add_to_collection("checkpoints", p1)
-    b =tf.cast(tf.greater(cx,-0.01),tf.float32)*tf.cast(tf.greater(cy,-0.01),tf.float32)*tf.cast(tf.greater(cz,-0.01),tf.float32)
-    b *= tf.cast(tf.greater(1.01,cx),tf.float32)*tf.cast(tf.greater(1.01,cy),tf.float32)*tf.cast(tf.greater(1.01,cz),tf.float32)
-    return p1*tf.expand_dims(b,-1)
-
 def getPlanes(index):
+  print(index)
   dis=np.linalg.norm(np.transpose(ref_c[index]) - np.array([ccx,ccy,ccz]),2)
   cop = (dx+dy+dz)/3
-  dmin = dis-cop
-  dmax = dis+cop
+  bias = -0.1
+  dmin = dis-cop#+bias
+  dmax = dis+cop+bias
   if FLAGS.invz:
     return 1/np.linspace(1, 0.0001, num_mpi) * dmin
   else:
     return np.linspace(dmin, dmax, num_mpi)
 
-def network(mpi, latent,bg, rot,tra, index, is_training):
+def network(mpi, depth, bg, rot,tra, index, is_training):
   alpha = 1
   output = 0
   mask = 0.0
@@ -229,15 +203,15 @@ def network(mpi, latent,bg, rot,tra, index, is_training):
       for j in range(sub_sam):
           vv = j/sub_sam
           dep = rplanes[i]*(1-vv) + rplanes[i+1]*(vv)
-          depth = sampleDepth(latent,dep, index)
-          img = samplePlane(tf.concat([mpi[i], depth], -1),rot,tra, dep, 1,index)
-          tf.add_to_collection("checkpoints", img)
+          depth_map = depth[i,:,:,j:j+1]
+          img = samplePlane(tf.concat([mpi[i], depth_map], -1),rot,tra, dep, 1,index)
+          #tf.compat.v1.add_to_collection("checkpoints", img)
           img = img[0]
           out += img[:,:,:4]*img[:,:,4:5]*aa
           aa  *= (1-img[:,:,4:5])
-          depth = tf.image.resize_images(depth, [int(h/8), int(w/8)], tf.image.ResizeMethod.AREA)
-          sublayers.append(depth)
-          if j == 1:
+          depth_map = tf.image.resize(depth_map, [int(h/8), int(w/8)], tf.image.ResizeMethod.AREA)
+          sublayers.append(depth_map)
+          if j == 0:
               imgs.append(img)
       output += out[:,:,:3]*out[:,:,3:4]*alpha
       alpha *= (1-out[:,:,3:4])
@@ -246,80 +220,102 @@ def network(mpi, latent,bg, rot,tra, index, is_training):
   output += (1-mask)*bg
   return output, imgs, sublayers
 
+
+def gen_depth(input,is_train,reuse=False):
+    with tf.compat.v1.variable_scope('depth') as scope:
+        if reuse: scope.reuse_variables()
+
+        next = input#tf.expand_dims( input,0)
+        with slim.arg_scope(
+            [slim.conv2d, slim.fully_connected],
+            normalizer_fn=slim.batch_norm,
+            activation_fn=lambda x: tf.nn.leaky_relu(x, alpha=0.1),
+            normalizer_params={"is_training": is_train}
+            ):
+
+            #next = slim.conv2d(next,16,[3,3],stride=2)
+            for chanel in [32,48,32]:
+                next = slim.conv2d(next,chanel,[3,3])
+                next = slim.conv2d(next,chanel,[3,3], stride=2)
+
+            next = slim.conv2d(next,FLAGS.sublayers,[3,3],
+                    biases_initializer=tf.constant_initializer(-5.0),
+                    activation_fn=tf.sigmoid)
+    return next
+
 def train():
-    lod_in = tf.placeholder(tf.float32, shape=[], name='lod_in')
-    rot = tf.placeholder(tf.float32, shape=[3,3], name='rotation')
-    tra = tf.placeholder(tf.float32, shape=[3,1], name='translation')
-    real_img = tf.placeholder(tf.float32, shape=[h,w,3], name='ex_img')
+    lod_in = tf.compat.v1.placeholder(tf.float32, shape=[], name='lod_in')
+    rot = tf.compat.v1.placeholder(tf.float32, shape=[3,3], name='rotation')
+    tra = tf.compat.v1.placeholder(tf.float32, shape=[3,1], name='translation')
+    real_img = tf.compat.v1.placeholder(tf.float32, shape=[h,w,3], name='ex_img')
 
-    latent = np.random.uniform(-5,0,[laten_d, laten_h, laten_w, 1]).astype(np.float32)
     int_mpi1 = np.random.uniform(-1, 0,[num_mpi, h, w, 3]).astype(np.float32)
-    int_mpi2 = np.random.uniform(-2, 0,[num_mpi, h, w, 1]).astype(np.float32)
+    int_mpi2 = np.random.uniform(-5,-1,[num_mpi, h, w, 1]).astype(np.float32)
     int_mpi = np.concatenate([int_mpi1,int_mpi2],-1)
+    depth_init = np.random.uniform(-5,0,[num_mpi, int(h/ FLAGS.subscale), int(w/ FLAGS.subscale), sub_sam]).astype(np.float32)
+    #if(FLAGS.sublayers<1):
+    #  depth = tf.get_variable("Net_depth", initializer=depth_init*0+1, trainable=False)
+    #else:
+    depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
+    depth0 = tf.sigmoid(depth)
 
-    backup = tf.get_variable("Net_backup", initializer=latent, trainable=False)
-    latent = tf.get_variable("Net_depth", initializer=latent, trainable=True)
-    latent = tf.sigmoid(latent)
-
-    bg = tf.get_variable("Net_bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
-    bgup = tf.get_variable("Net_backupbg", initializer=np.array([1,1,1],dtype=np.float32), trainable=False)
-    #noise = 0.05*(2*tf.random_uniform(bg.shape)-1) * (1-lod_in/2200)
+    bg = tf.compat.v1.get_variable("Net_bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
     bg = tf.sigmoid(bg)
 
-    mpis = []
-    image_out = []
-    longs = []
-    losses = []
-    summaries = []
-    train_ops = []
-
     #lr = 0.1
-    lr = tf.compat.v1.train.exponential_decay(0.1,lod_in,1000,0.1)
-    optimizer = tf.train.AdamOptimizer(lr)
+    lr = tf.compat.v1.train.exponential_decay(0.1,lod_in,1000,0.2)
+    optimizer = tf.compat.v1.train.AdamOptimizer(lr)
     #optimizer = tf.train.RMSPropOptimizer(lr)
-    for i in range(num_):
-        with tf.compat.v1.variable_scope("Net%d"%((FLAGS.index+i)%mpi_max)):
-            mpi = tf.get_variable("mpi", initializer=int_mpi, trainable=True)
-            mpi = tf.sigmoid(mpi)
-            mpis.append(mpi)
-            img_out, shifts, sss = network(mpis[i], latent, bg, rot,tra,(FLAGS.index+i)%mpi_max, False)
-            long = tf.concat(shifts, 1)
+    with tf.compat.v1.variable_scope("Net"):
+        mpi = tf.compat.v1.get_variable("mpi", initializer=int_mpi, trainable=True)
+        mpi = tf.sigmoid(mpi)
+        #depth = gen_depth(mpi,True)
+        depth = tf.image.resize(depth0, [h, w], align_corners=True)
+        img_out, shifts, sss = network(mpi, depth, bg, rot,tra,(FLAGS.index)%mpi_max, False)
+        long = tf.concat(shifts, 1)
 
-        with tf.compat.v1.variable_scope("loss%d"%((FLAGS.index+i)%mpi_max)):
-            tva = tf.constant(0.1)
-            tvc = tf.constant(0.005)
-            mpiColor = mpi[:, :, :, :3]
-            mpiAlpha = mpi[:, :, :, 3:4]
-            loss =  100000 * tf.reduce_mean(tf.square(img_out - real_img))
-            loss += tva * tf.reduce_mean(tf.image.total_variation (mpiAlpha))
-            loss += tvc * tf.reduce_mean(tf.image.total_variation(mpiColor))
-            losses.append(loss)
 
-        with tf.compat.v1.variable_scope("post%d"%((FLAGS.index+i)%mpi_max)):
-            image_out.append(tf.clip_by_value(img_out,0.0,1.0))
-            longs.append(tf.clip_by_value(long,0.0,1.0) )
-            train_ops.append(slim.learning.create_train_op(losses[i],optimizer))
+    with tf.compat.v1.variable_scope("loss"):
+        tva = tf.constant(0.1)
+        tvc = tf.constant(0.005) * 0.1
+        avl = tf.constant(0.01)
+        mpiColor = mpi[:, :, :, :3]
+        mpiAlpha = mpi[:, :, :, 3:4]
+        loss =  100000 * tf.reduce_mean(tf.square(img_out - real_img))
+        loss += tva * tf.reduce_mean(tf.image.total_variation (mpiAlpha))
+        loss += tvc * tf.reduce_mean(tf.image.total_variation(mpiColor))
+        loss += avl * tf.reduce_mean(tf.image.total_variation(depth0))
+        loss += avl * tf.reduce_mean(abs(depth0[:,:,:,:-1] - depth0[:,:,:,1:]) )
 
-            summary = tf.compat.v1.summary.merge([
-                            tf.compat.v1.summary.scalar("all_loss", losses[i]),
-                            tf.compat.v1.summary.image("out",tf.expand_dims(image_out[i],0)),
-                            tf.compat.v1.summary.image("origi",tf.expand_dims(real_img,0)),
-                            tf.compat.v1.summary.image("alpha",tf.expand_dims(longs[i][:,:,4:5],0)),
-                            tf.compat.v1.summary.image("color",tf.expand_dims(longs[i][:,:,:3]*longs[i][:,:,4:5],0)),
-                            ])
-            summaries.append(summary)
+        #d_loss = tf.reduce_mean(tf.square(fake_result-1)) + tf.reduce_mean(tf.square(real_result))
 
-    netb = tf.contrib.framework.get_variables_by_name("Net_backup")
-    netb.append(tf.contrib.framework.get_variables_by_name("Net_backupbg")[0])
-    netd = tf.contrib.framework.get_variables_by_name("Net_depth")
-    netd.append(tf.contrib.framework.get_variables_by_name("Net_bg")[0])
-    backup = [v.assign(netd[i]) for i, v in enumerate(netb)]
-    loadup = [v.assign(netd[i]*0.5+netb[i]*0.5) for i, v in enumerate(netd)]
-    
+    t_vars = tf.compat.v1.trainable_variables()
+    d_vars = [var for var in t_vars if 'dis' in var.name]
+    g_vars = [var for var in t_vars if 'dis' not in var.name]
+
+    with tf.compat.v1.variable_scope("post%d"%(FLAGS.index%mpi_max)):
+        image_out = tf.clip_by_value(img_out,0.0,1.0)
+        train_op = slim.learning.create_train_op(loss,optimizer,variables_to_train=g_vars)
+        #train_dis = slim.learning.create_train_op(d_loss,optimizer,variables_to_train=d_vars)
+        
+        long = tf.clip_by_value(long,0.0,1.0)
+
+        summary = tf.compat.v1.summary.merge([
+                        tf.compat.v1.summary.scalar("all_loss", loss),
+                        #tf.compat.v1.summary.scalar("dis_loss", d_loss),
+
+                        tf.compat.v1.summary.image("out",tf.expand_dims(image_out,0)),
+                        tf.compat.v1.summary.image("origi",tf.expand_dims(real_img,0)),
+                        tf.compat.v1.summary.image("alpha",tf.expand_dims(long[:,:,4:5],0)),
+                        tf.compat.v1.summary.image("color",tf.expand_dims(long[:,:,:3]*long[:,:,3:4],0)),
+                        #tf.compat.v1.summary.image("map_areal",real_result),
+                        #tf.compat.v1.summary.image("map_fake",fake_result),
+                        #tf.compat.v1.summary.image("map_fake",tf.concat([real_result,fake_result],2)),
+                        ])
+
     config = ConfigProto()
     config.gpu_options.allow_growth = True
     #config = ConfigProto(device_count = {'GPU': 0})
-    #localpp = getLocalPath("/home2/suttisak","TensorB/"+FLAGS.dataset)
     localpp = "TensorB/"+FLAGS.dataset
     if FLAGS.index==0:
       if os.path.exists(localpp):
@@ -331,58 +327,55 @@ def train():
 
     saver = tf.train.Saver()
     #localpp = getLocalPath("/home2/suttisak",'./model/' + FLAGS.dataset +'/'+ FLAGS.input+str(FLAGS.index%mpi_max))
-    localpp = './model/' + FLAGS.dataset +'/'+ FLAGS.input+str(FLAGS.index%mpi_max)
+    localpp = './model/' + FLAGS.dataset +'/tem'+str(FLAGS.index%mpi_max)
     if not os.path.exists(localpp):
         os.makedirs(localpp)
 
-    for i_mpi in range(num_):
-        features0 = load_data(i_mpi,is_shuff = False)
-        features = load_data(i_mpi,is_shuff = True)
-        sess = tf.Session(config=config)
-        if i_mpi == 0:
-            sess.run(tf.global_variables_initializer())
-            if FLAGS.index>0:
-                t_vars = slim.get_variables_to_restore()
-                vars_to_restore = [var for var in t_vars if 'Net%d'%((FLAGS.index+1)%mpi_max) not in var.name and 'Net' in var.name and 'Adam' not in var.name]
-                saver = tf.train.Saver(vars_to_restore)
-                #localpp0 = getLocalPath("/home2/suttisak",'./model/' + FLAGS.dataset +'/'+ FLAGS.input+str((FLAGS.index-1)%mpi_max))
-                localpp0 = './model/' + FLAGS.dataset +'/'+ FLAGS.input+str((FLAGS.index-1)%mpi_max)
-                ckpt = tf.train.latest_checkpoint(localpp0)
-                saver.restore(sess, ckpt)
-                saver = tf.train.Saver()
+    features = load_data(0,is_shuff = True)
+    sess = tf.compat.v1.Session(config=config)
+    if 0:
+        variables_to_restore = slim.get_variables_to_restore()
+        saver = tf.train.Saver(variables_to_restore)
+        ckpt = tf.train.latest_checkpoint(localpp )
+        saver.restore(sess, ckpt)
+    else:
+        if FLAGS.index>mpi_max-1:
+          variables_to_restore = slim.get_variables_to_restore()
+          saver = tf.train.Saver(variables_to_restore)
+          ckpt = tf.train.latest_checkpoint(localpp )
+          saver.restore(sess, ckpt)
         else:
-            variables_to_restore = slim.get_variables_to_restore()
-            saver = tf.train.Saver(variables_to_restore)
-            ckpt = tf.train.latest_checkpoint(localpp )
-            saver.restore(sess, ckpt)
+          sess.run(tf.compat.v1.global_variables_initializer())
 
-        feed0 = sess.run(features0)
-        if (FLAGS.index==0 and i_mpi==0): FLAGS.epoch = int(FLAGS.epoch*1.5)
-        if (FLAGS.index==0 and i_mpi==1): FLAGS.epoch = int(FLAGS.epoch/1.5)
-        for i in range(FLAGS.epoch + 3):
-            feed = sess.run(features)
-            lodin = int(FLAGS.index/mpi_max)*int(FLAGS.epoch/2)
-            if (i_mpi==0 and i<2000):
-                _,los = sess.run([train_ops[i_mpi],losses[i_mpi]],feed_dict={lod_in:lodin+i,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
-            elif(i_mpi==0 and FLAGS.epoch - i < 0):
-                _,los = sess.run([train_ops[i_mpi],losses[i_mpi]],feed_dict={lod_in:lodin+i,tvc:0.0005,rot:feed0["r"][0],tra:feed0["t"][0],real_img:feed0["img"][0]})
-            else:
-                _,los = sess.run([train_ops[i_mpi],losses[i_mpi]],feed_dict={lod_in:lodin+i,tvc:0.001,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
+        if FLAGS.index>0:
+          t_vars = slim.get_variables_to_restore()
+          localppp = './model/' + FLAGS.dataset +'/tem'+str((FLAGS.index-1)%mpi_max)
+          vars_to_restore = [var for var in t_vars if 'depth' in var.name and 'post' not in var.name]
+          #vars_to_restore = vars_to_restore[:5]
+          #print(len(vars_to_restore),vars_to_restore)
+          saver = tf.train.Saver(vars_to_restore)
+          ckpt = tf.train.latest_checkpoint(localppp )
+          saver.restore(sess, ckpt)
+          saver = tf.train.Saver()
 
-            if i%100==0:
-                print(FLAGS.index,i_mpi,i, "loss = " ,los)
-            if i%20 == 0:
-               if(FLAGS.index>mpi_max-8): sess.run(loadup)
-               if(FLAGS.epoch - i < 20):
-                 summ = sess.run(summaries[i_mpi],feed_dict={lod_in:lodin+i,rot:feed0["r"][0],tra:feed0["t"][0],real_img:feed0["img"][0]})
-               else:
-                 summ = sess.run(summaries[i_mpi],feed_dict={lod_in:lodin+i,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
-               blank = 0.0
-               if(i_mpi==0 and FLAGS.index!=0): blank += FLAGS.epoch
-               writer.add_summary(summ,blank+i)
-            if i%200==1:
-               sess.run(backup)
-               saver.save(sess, localpp + '/' + str(i))
+    for i in range(FLAGS.epoch + 3):
+        feed = sess.run(features)
+        lodin = int(FLAGS.index/mpi_max)*int(FLAGS.epoch/2)
+        if i < 6000:
+            _,los = sess.run([train_op,loss],feed_dict={lod_in:i,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
+        else:
+            _,los = sess.run([train_op,loss],feed_dict={lod_in:600,avl:1000,tvc:0.0,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
+        
+        #for j in range(5):
+        #    _,dlos = sess.run([train_dis,d_loss],feed_dict={lod_in:600,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
+    
+        if i%100==0:
+            print(FLAGS.index,i, "loss = " ,los)
+        if i%20 == 0:
+            summ = sess.run(summary,feed_dict={lod_in:i,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
+            writer.add_summary(summ,i)
+        if i%200==1:
+            saver.save(sess, localpp + '/' + str(i))
 
 
 def predict():
@@ -398,25 +391,20 @@ def predict():
       fs["t"] = tf.reshape(fs["t"], [3, 1])
       return fs
 
-    lod_in = tf.placeholder(tf.float32, shape=[], name='lod_in')
-    rot = tf.placeholder(tf.float32, shape=[3,3], name='rotation')
-    tra = tf.placeholder(tf.float32, shape=[3,1], name='translation')
+    lod_in = tf.compat.v1.placeholder(tf.float32, shape=[], name='lod_in')
+    rot = tf.compat.v1.placeholder(tf.float32, shape=[3,3], name='rotation')
+    tra = tf.compat.v1.placeholder(tf.float32, shape=[3,1], name='translation')
 
 
-    testset = tf.data.TFRecordDataset(["datasets/" + FLAGS.dataset + "/tem" + str(FLAGS.index%mpi_max)+ ".test"])
+    testset = tf.data.TFRecordDataset(["datasets/" + FLAGS.dataset + "/" + FLAGS.input +".test"])
     testset = testset.map(parser).repeat().batch(1).make_one_shot_iterator()
     features = testset.get_next()
 
 
-    bg = tf.get_variable("Net_bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
+    bg = tf.compat.v1.get_variable("Net_bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
     bg = tf.sigmoid(bg)
 
-    latent = np.zeros([laten_d, laten_h, laten_w, 1],dtype=np.float32)
-
-    latent[-2:laten_d,:,:,0] = 0.5
-    for i in range(laten_d):
-        ch, cw = int(laten_h/2-i/2), int(laten_w/2-i/4)
-        latent[i,ch-10:ch+10,cw-5:cw+5,0] = 1.0
+    depth_init = np.random.uniform(-5,0,[num_mpi, int(h/ FLAGS.subscale), int(w/ FLAGS.subscale), sub_sam]).astype(np.float32)
 
     mpi = np.zeros([num_mpi, h, w, 4],dtype=np.float32)
     mpi[0] = [1.,0.,0.,.95]
@@ -424,51 +412,37 @@ def predict():
     mpi[2] = [1.,1.,0.,.95]
     mpi[3] = [.5,1.,0.,.95]
 
-    latent = tf.get_variable("Net_depth", initializer=latent, trainable=False)
-    latent = tf.sigmoid(latent)
-    mpis = []
-    image_out = []
-    longs = []
-    ssss = []
+    depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
+    depth = tf.sigmoid(depth)
+    #depth = tf.image.resize(depth, [h, w], align_corners=True)
 
-    for i in range(num_):
-        with tf.compat.v1.variable_scope("Net%d"%((FLAGS.index+i)%mpi_max)):
-            mpi = tf.get_variable("mpi", initializer=mpi, trainable=True)
-            mpi = tf.sigmoid(mpi)
-            mpis.append(mpi)
 
-            img_out, shifts, sss = network(mpis[i], latent, bg, rot,tra,(FLAGS.index+i)%mpi_max, False)
-            ssss.append(sss)
-            long = tf.concat(shifts, 1)
+    with tf.compat.v1.variable_scope("Net"):
+        mpi = tf.compat.v1.get_variable("mpi", initializer=mpi, trainable=False)
+        mpi = tf.sigmoid(mpi)
+        #depth = gen_depth(mpi,False)
+        depth = tf.image.resize(depth, [h, w], align_corners=True)
+        img_out, shifts, sss = network(mpi, depth, bg, rot,tra,FLAGS.index%mpi_max, False)
+        long = tf.concat(shifts, 1)
 
-        with tf.compat.v1.variable_scope("post%d"%((FLAGS.index+i)%mpi_max)):
-            image_out.append(tf.clip_by_value(img_out,0.0,1.0))
-            longs.append(tf.clip_by_value(long,0.0,1.0) )
+    with tf.compat.v1.variable_scope("post"):
+        image_out= tf.clip_by_value(img_out,0.0,1.0)
+        longs = tf.clip_by_value(long,0.0,1.0) 
 
     config = ConfigProto()
     config.gpu_options.allow_growth = True
     #config = ConfigProto(device_count = {'GPU': 0})
-    sess = tf.Session(config=config)
-    sess.run(tf.global_variables_initializer())
+    sess = tf.compat.v1.Session(config=config)
+    sess.run(tf.compat.v1.global_variables_initializer())
     variables_to_restore = slim.get_variables_to_restore()
     saver = tf.train.Saver(variables_to_restore)
     #localpp = getLocalPath("/home2/suttisak",'./model/' + FLAGS.dataset +'/'+ FLAGS.input+str((FLAGS.index)%mpi_max))
-    localpp = './model/' + FLAGS.dataset +'/'+ FLAGS.input+str((FLAGS.index)%mpi_max)
+    localpp = './model/' + FLAGS.dataset +'/tem'+str((FLAGS.index)%mpi_max)
     ckpt = tf.train.latest_checkpoint(localpp )
     saver.restore(sess, ckpt)
 
-    if FLAGS.FromFuture:
-        t_vars = slim.get_variables_to_restore()
-        vars_to_restore = [var for var in t_vars if 'Net%d'%((FLAGS.index+1)%mpi_max) in var.name and 'Adam' not in var.name]
-        #print(vars_to_restore)
-        saver = tf.train.Saver(vars_to_restore)
-        #localpp0 = getLocalPath("/home2/suttisak",'./model/' + FLAGS.dataset +'/'+ FLAGS.input+str((FLAGS.index+1)%mpi_max))
-        localpp0 = './model/' + FLAGS.dataset +'/'+ FLAGS.input+str((FLAGS.index+1)%mpi_max)
-        ckpt = tf.train.latest_checkpoint(localpp0 )
-        saver.restore(sess, ckpt)
 
-
-    if False:
+    if True:
         a = 0
         #out, bug = sess.run([img_out,latent])
         #tt = np.concatenate([bug[1,:,:,0],bug[20,:,:,0],bug[40,:,:,0],bug[59,:,:,0]],1)
@@ -476,25 +450,34 @@ def predict():
         #plt.show()
     else:
         for i in range(0,300,1):
+          try:
+            out0 = cv2.imread("result/frame/"+FLAGS.dataset+"_%04d.png"%((300*(FLAGS.index%mpi_max) + i-300)%(300*mpi_max)))
+            out0 = cv2.cvtColor(out0, cv2.COLOR_BGR2RGB)/255.0
             feed = sess.run(features)
-            if(i%50==0): print(i)
-            #out0, out1 = sess.run([image_out[0],image_out[1]])
-            out0 = sess.run(image_out[0],feed_dict={rot:feed["r"][0],tra:feed["t"][0]})
-            out1 = sess.run(image_out[1],feed_dict={rot:feed["r"][0],tra:feed["t"][0]})
-            #out, bug = sess.run([img_out,long])
-            #out0 = np.rot90(out0)
-            #out1 = np.rot90(out1)
-            out = (1-i/300)*out0 + (i/300)*out1 #np.concatenate((out0,out1),1)
-            #plt.imsave("result/%04d.png"%(i),bug[:,:,:3])
-            plt.imsave("result/frame/"+FLAGS.dataset+"_%04d.png"%(300*(FLAGS.index%mpi_max) + i),out)
+            if(i%50==0): print(i, ((300*(FLAGS.index%mpi_max) + i-300)%(300*mpi_max)))
+            out = sess.run(image_out,feed_dict={rot:feed["r"][0],tra:feed["t"][0]})
+            ii = i/300
+            out =  np.clip(out*ii+out0*(1-ii),0.0,1.0)
+            plt.imsave("result/frame/"+FLAGS.dataset+"_%04d.png"%((300*(FLAGS.index%mpi_max) + i-300)%(300*mpi_max)),out)
+          except:
+            feed = sess.run(features)
+            if(i%50==0): print(i, ((300*(FLAGS.index%mpi_max) + i-300)%(300*mpi_max)))
+            out = sess.run(image_out,feed_dict={rot:feed["r"][0],tra:feed["t"][0]})
+            plt.imsave("result/frame/"+FLAGS.dataset+"_%04d.png"%((300*(FLAGS.index%mpi_max) + i-300)%(300*mpi_max)),out)
+
+        if(not FLAGS.endvdo):
+          for i in range(0,300,1):
+              feed = sess.run(features)
+              if(i%50==0): print(i, (300*(FLAGS.index%mpi_max) + i))
+              out = sess.run(image_out,feed_dict={rot:feed["r"][0],tra:feed["t"][0]})
+              plt.imsave("result/frame/"+FLAGS.dataset+"_%04d.png"%(300*(FLAGS.index%mpi_max) + i),out)
 
         cmd = 'ffmpeg -y -i ' + 'result/frame/'+FLAGS.dataset+'_%04d.png -c:v libx264 -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" -pix_fmt yuv420p result/'+FLAGS.dataset+'_moving.mp4'
         print(cmd)
         os.system(cmd)
 
-    if False:
-      #webpath = "/var/www/html/orbiter/"
-      webpath = "webpath/"
+    if True:
+      webpath = "webpath/"  #"/var/www/html/orbiter/"
       if not os.path.exists(webpath + FLAGS.dataset):
           os.system("mkdir " + webpath + FLAGS.dataset)
 
@@ -503,7 +486,7 @@ def predict():
         ref_rt = np.array(ref_r[FLAGS.index+ii:FLAGS.index+ii+1])
         ref_tt = np.array(ref_t[FLAGS.index+ii:FLAGS.index+ii+1])
         print(ref_rt.shape)
-        ret, sublay = sess.run([mpis[ii],ssss[ii]],feed_dict={features['r']:ref_rt,features['t']:ref_tt})
+        ret, sublay = sess.run([mpi,sss],feed_dict={features['r']:ref_rt,features['t']:ref_tt})
         sublayers = []
         mpis = []
         sublayers_combined = []
@@ -545,7 +528,7 @@ def predict():
             fo.write(str(ref_r[FLAGS.index][ i, j]) + " ")
         fo.write(" ".join([str(x) for x in np.nditer(ref_t[(FLAGS.index)])]) + "\n")
 
-      generateWebGL(webpath + FLAGS.dataset+ "/index.html", w, h, getPlanes(),namelist,sub_sam, f, px, py)
+      #generateWebGL(webpath + FLAGS.dataset+ "/index.html", w, h, getPlanes(),namelist,sub_sam, f, px, py)
 
 def main(argv):
     setGlobalVariables()

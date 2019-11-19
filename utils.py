@@ -4,6 +4,9 @@ import json
 import tensorflow as tf
 import numpy as np
 import traceback
+import math
+
+_EPS = np.finfo(float).eps * 4.0
 
 def get_pixel_value(img, u, v):
     indices = tf.stack([ u, v], 3)
@@ -166,6 +169,86 @@ def nearest3d_sampler(mpi, x, y, z):
 
   out = wa*Ia + wb*Ib + wc*Ic + wd*Id
   return out
+
+
+def quaternion_from_matrix(matrix):
+    matrix = np.r_[np.c_[matrix, np.array([[0],[0],[0]])], np.array([[0,0,0,1]])]
+    # Return quaternion from rotation matrix.
+    M = np.array(matrix, dtype=np.float64, copy=False)[:4, :4]
+    q = np.empty((4, ))
+    t = np.trace(M)
+    if t > M[3, 3]:
+        q[0] = t
+        q[3] = M[1, 0] - M[0, 1]
+        q[2] = M[0, 2] - M[2, 0]
+        q[1] = M[2, 1] - M[1, 2]
+    else:
+        i, j, k = 0, 1, 2
+        if M[1, 1] > M[0, 0]:
+            i, j, k = 1, 2, 0
+        if M[2, 2] > M[i, i]:
+            i, j, k = 2, 0, 1
+        t = M[i, i] - (M[j, j] + M[k, k]) + M[3, 3]
+        q[i] = t
+        q[j] = M[i, j] + M[j, i]
+        q[k] = M[k, i] + M[i, k]
+        q[3] = M[k, j] - M[j, k]
+        q = q[[3, 0, 1, 2]]
+    q *= 0.5 / math.sqrt(t * M[3, 3])
+    if q[0] < 0.0:
+        np.negative(q, q)
+    return q
+
+def quaternion_matrix(quaternion):
+    # Return homogeneous rotation matrix from quaternion.
+    q = np.array(quaternion, dtype=np.float64, copy=True)
+    n = np.dot(q, q)
+    if n < _EPS:
+        return np.identity(4)
+    q *= math.sqrt(2.0 / n)
+    q = np.outer(q, q)
+    return np.array([ #print(len(js))
+        [1.0-q[2, 2]-q[3, 3],     q[1, 2]-q[3, 0],     q[1, 3]+q[2, 0], 0.0],
+        [    q[1, 2]+q[3, 0], 1.0-q[1, 1]-q[3, 3],     q[2, 3]-q[1, 0], 0.0],
+        [    q[1, 3]-q[2, 0],     q[2, 3]+q[1, 0], 1.0-q[1, 1]-q[2, 2], 0.0],
+        [                0.0,                 0.0,                 0.0, 1.0]])
+
+
+def unit_vector(data, axis=None, out=None):
+    # Return ndarray normalized by length, i.e. Euclidean norm, along axis.
+    data = np.array(data, dtype=np.float64, copy=True)
+    data /= math.sqrt(np.dot(data, data))
+    return data
+
+def quaternion_slerp(quat0, quat1, fraction, spin=0, shortestpath=True):
+    # Return spherical linear interpolation between two quaternions.
+    q0 = unit_vector(quat0[:4])
+    q1 = unit_vector(quat1[:4])
+    if fraction == 0.0:
+        return q0
+    elif fraction == 1.0:
+        return q1
+    d = np.dot(q0, q1)
+    if abs(abs(d) - 1.0) < _EPS:
+        return q0
+    if shortestpath and d < 0.0:
+        # invert rotation
+        d = -d
+        np.negative(q1, q1)
+    angle = math.acos(d) + spin * math.pi
+    if abs(angle) < _EPS:
+        return q0
+    isin = 1.0 / math.sin(angle)
+    q0 *= math.sin((1.0 - fraction) * angle) * isin
+    q1 *= math.sin(fraction * angle) * isin
+    q0 += q1
+    return q0
+
+def interpolate_rotation(m1, m2, t):
+  q1 = quaternion_from_matrix(m1)
+  q2 = quaternion_from_matrix(m2)
+  return quaternion_matrix(quaternion_slerp(q1, q2, t))[:3, :3]
+
 
 def findCameraSfm(dataset):
   path = "datasets/" + dataset + "/MeshroomCache/StructureFromMotion/"

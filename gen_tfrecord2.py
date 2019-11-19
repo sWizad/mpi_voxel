@@ -1,4 +1,4 @@
-### generate tfRecord for orbit around object project
+### generate tfRecord for Scene project
 import numpy as np
 import os
 import tensorflow as tf
@@ -258,66 +258,39 @@ def generate():
     #imgFolder = "datasets/" + FLAGS.dataset + "/segm" if FLAGS.skipexr else convertExr(cams)
     with tf.io.TFRecordWriter("datasets/" + FLAGS.dataset + "/" + FLAGS.output +".train") as tfrecord_writer:
       with tf.Session() as sess:
-        #px, py = [], []
-        for i in range(410):
-            i_pose = (i%41)
-            i_cam = int(i/41)
-            if index>=0:
-              dis_cyc = min((i_pose-index*4)%40,(index*4-i_pose)%40)
-              logic = dis_cyc**2+(i_cam-4)**2 <= 4**2 #(dis_cyc<4) and (i_cam<=8)
-            else:
-              dis_cyc = min((i_pose)%40,(-i_pose)%40)
-              logic = dis_cyc**2+(i_cam-4)**2 <= 4**2 # abs(i_cam-3)<=3 and 
-            if(logic):
-                print(i,i_cam,i_pose,scams[i][1]["filename"])
-                try:
-                    image_path = imgFolder + "/" + scams[i][1]["filename"]
-                    width, height = imagesize.get(image_path)
-                    image = tf.convert_to_tensor(image_path, dtype = tf.string)
-                    image = tf.io.read_file(image)
-                    ret = sess.run(image)
-                    example = tf.train.Example(features=tf.train.Features(
-                      feature={
-                        'img' : bytes_feature(ret),
-                        'r': f1(scams[i][1]["r"]),
-                        't': f1(scams[i][1]["t"]),
-                        'h': _int64_feature(height),
-                        'w': _int64_feature(width),
-                      }))
-                    tfrecord_writer.write(example.SerializeToString())
-                    #logic = (i_pose- 4)**2 + dis_cyc**2<=2**2
-                    logic = (i_cam==4) and dis_cyc<=3
-                    if logic:
-                      #print(5-dis_cyc)
-                      for j in range(5-dis_cyc):
-                        tfrecord_writer.write(example.SerializeToString())
-                      
-                    #px.append(dcams[i][1]["c"][1])
-                    #py.append(dcams[i][1]["c"][2])
-                except:
-                    print("file not exist")
-
-    #plt.scatter(px,py)
-    #plt.show()
-    #scams = sorted(dcams[:30], key=lambda x: x[1]["filename"])
+        for i in range(len(cams)):
+            print(i,scams[i][1]["filename"])
+            try:
+                image_path = imgFolder + "/" + scams[i][1]["filename"]
+                width, height = imagesize.get(image_path)
+                image = tf.convert_to_tensor(image_path, dtype = tf.string)
+                image = tf.io.read_file(image)
+                ret = sess.run(image)
+                example = tf.train.Example(features=tf.train.Features(
+                    feature={
+                    'img' : bytes_feature(ret),
+                    'r': f1(scams[i][1]["r"]),
+                    't': f1(scams[i][1]["t"]),
+                    'h': _int64_feature(height),
+                    'w': _int64_feature(width),
+                    }))
+                tfrecord_writer.write(example.SerializeToString())
+            except:
+                print("file not exist")
+                
     with tf.io.TFRecordWriter("datasets/" + FLAGS.dataset + "/" + FLAGS.output + ".test") as tfrecord_writer:
-        #dirt = [41*(4)+index*4, 41*(4)+index*4+1, 41*(4)+index*4+2, 41*(4)+index*4+3, 41*(4)+index*4+4]
-        #dirt = [41*(4)+36, 41*(4)+38, 41*(4), 41*(4)+2, 41*(4)+4, 41*(4)+6]
-        dirt = [41*(4)+(index*4+tt)%40 for tt in range(-4,6)]
-        n = 75
-        m = len(dirt)-2
-        #print(scams[FLAGS.start][1]["filename"])
-        #print(scams[FLAGS.end][1]["filename"])
+        dirt = [0, 4, 20, 24, 25,]
+        m = len(dirt)-2        
+        n = 100
         for i in range(m):
             print(scams[dirt[i]][1]["filename"]," to" ,scams[dirt[i+1]][1]["filename"])
-
             for j in range(n):
                   tt = (j+0.5) / n # avoid the train image, especially the ref image
                   rot = interpolate_rotation(scams[dirt[i]][1]["r"], scams[dirt[i+1]][1]["r"], tt)
-                  #t = scams[dirt[i]][1]["t"] * (1-tt) + scams[dirt[i+1]][1]["t"] * tt #linear interpolate
-                  t = scams[dirt[i]][1]["t"] *(1-tt)*(2-tt)*0.5
-                  t += scams[dirt[i+1]][1]["t"] *tt*(2-tt) 
-                  t += scams[dirt[i+2]][1]["t"] *tt*(tt-1)* 0.5 #quadratic interpolate
+                  t = scams[dirt[i]][1]["t"] * (1-tt) + scams[dirt[i+1]][1]["t"] * tt #linear interpolate
+                  #t = scams[dirt[i]][1]["t"] *(1-tt)*(2-tt)*0.5
+                  #t += scams[dirt[i+1]][1]["t"] *tt*(2-tt) 
+                  #t += scams[dirt[i+2]][1]["t"] *tt*(tt-1)* 0.5 #quadratic interpolate
 
                   example = tf.train.Example(features=tf.train.Features(
                     feature={
@@ -329,33 +302,5 @@ def generate():
 
 
 if __name__ == "__main__":
-    """
-    print("Hey!!")
-    cams = readCamera()
-    dcams = sorted(cams.items(), key=lambda x: x[1]["dis"])
-    px, py,area = [], [], []
-    for i in range(300):
-    #    cx += dcams[i][1]["c"][1]
-    #    cy += dcams[i][1]["c"][2]
-        if dcams[i][1]["dis"]>4 and dcams[i][1]["angle"]<cams[ref_img[1]]["angle"]:
-            print(dcams[i][1]["dis"])
-            area.append((dcams[i][1]["angle"]/np.pi+1)*100)
-            px.append(dcams[i][1]["c"][1])
-            py.append(dcams[i][1]["c"][2])
-    #cx /= 300
-    #cy /= 300
-    plt.scatter(px,py,s=area)
-    #plt.scatter([cx],[cy])
-    """
-    #cams = readCamera()
-    #px, py= [],[]
-    #for id in ref_img:
-        #print(cams[id]["c"].shape)
-    #    px.append(cams[id]["c"][1,0])
-    #    py.append(cams[id]["c"][2,0])
 
-    #plt.scatter(px,py,c='r')
-    #plt.show()
-    #dcams = sorted(cams.items(), key=lambda x: x[1]["dis"])
-    #scams = sorted(dcams[:30], key=lambda x: x[1]["filename"])
     generate()
