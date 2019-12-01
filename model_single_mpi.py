@@ -147,6 +147,73 @@ def computeHomography(r, t, d, ks=1,index=0):
 
   return tf.matmul(tf.matmul(k, Ha + Hb / (-d-Hc)), ki)
 
+def computeHomography2(r, t, d, ks=1,index=0):
+  global f, px, py, ref_r, ref_t
+
+  # equivalent to right multiplying [r; t] by the inverse of [ref_r, r ef_t]
+  new_r = tf.matmul(r, tf.transpose(ref_r))
+  new_t = tf.matmul(tf.matmul(-r, tf.transpose(ref_r)), ref_t) + t
+
+  n = tf.constant([[0.0, 0.0, 1.0]])
+  Ha = tf.transpose(new_r)
+
+  Hb = tf.matmul(tf.matmul(tf.matmul(Ha, new_t), n), Ha)
+  Hc = tf.matmul(tf.matmul(n, Ha), new_t)[0]
+
+  k = tf.constant([[f, 0, px], [0, f, py], [0, 0, 1]])
+  k = tf.expand_dims(k,0)
+  Ha = tf.expand_dims(Ha,0)
+  Hb = tf.expand_dims(Hb,0)
+  #Hc = tf.expand_dims(Hc,0)
+  ki = tf.linalg.inv(k)
+
+  if ks != 1:
+    k = tf.constant([[f*ks, 0, px], [0, f*ks, py], [0, 0, 1]])
+  dd = (-d-Hc)
+  dd = tf.expand_dims(dd,-1)
+  dd = tf.expand_dims(dd,-1)
+  ss = Ha + Hb / dd
+
+  return tf.matmul(tf.matmul(k, ss), ki)
+
+def samplePlane2(plane, r, t, d, ks=1):
+  global nw, nh, offset
+  #nh = h + offset * 2
+  #nw = w + offset * 2
+
+  H = computeHomography(r, t, d, ks)
+
+  x, y = tf.meshgrid(list(range(w)), list(range(h)))
+  x = tf.cast(x, tf.float32)
+  y = tf.cast(y, tf.float32)
+  coords = tf.stack([x, y, tf.ones_like(x)], 2)
+  for i in range(4):
+    newC = tf.matmul(coords,tf.transpose(H[i]))
+    newC = tf.expand_dims(newC,0)
+    newCoords = newC if i == 0 else tf.concat([newCoords,newC],0)
+  #print("coords",coords.shape)
+  #coords = tf.expand_dims(coords,0)
+  #coords = tf.expand_dims(coords,-1)
+  #H = tf.transpose(H,perm=[0,2,1])
+  #H = tf.reshape(H, [-1,1,1,3,3])
+  #newCoords = tf.matmul(H,coords)
+  #print("newCoords",newCoords.shape)
+  #newCoords = tf.matmul(coords, H)
+  #newCoords = tf.Print(newCoords,[newCoords[0]])
+  #exit()
+  cx = newCoords[:,:, :,0] / newCoords[:,:, :,2]
+  cy = newCoords[:,:, :,1] / newCoords[:,:, :,2]
+
+  #cx = newCoords[:,:, :,0, 0] / newCoords[:,:, :,2,0]
+  #cy = newCoords[:,:, :,1, 0] / newCoords[:,:, :,2,0]
+
+  #cx = newCoords[:,:, :,0, 0] / newCoords[:,:, :,0, 2]
+  #cy = newCoords[:,:, :,0, 1] / newCoords[:,:, :,0, 2]
+  #cx = tf.expand_dims(newCoords[:, :, 0] / newCoords[:, :, 2], 0)
+  #cy = tf.expand_dims(newCoords[:, :, 1] / newCoords[:, :, 2], 0)
+
+  return bilinear_sampler2(plane, cx + offset, cy + offset)
+
 def samplePlane(plane, r, t, d, ks=1):
   global nw, nh, offset
   #nh = h + offset * 2
@@ -160,18 +227,26 @@ def samplePlane(plane, r, t, d, ks=1):
   coords = tf.stack([x, y, tf.ones_like(x)], 2)
   newCoords = tf.matmul(coords, tf.transpose(H))
 
-  cx = tf.expand_dims(newCoords[:, :, 0] / newCoords[:, :, 2], 0)
-  cy = tf.expand_dims(newCoords[:, :, 1] / newCoords[:, :, 2], 0)
+  #cx = tf.expand_dims(newCoords[:, :, 0] / newCoords[:, :, 2], 0)
+  #cy = tf.expand_dims(newCoords[:, :, 1] / newCoords[:, :, 2], 0)
+  cx = newCoords[:, :, 0] / newCoords[:, :, 2]
+  cy = newCoords[:, :, 1] / newCoords[:, :, 2]
 
   return bilinear_sampler(plane, cx + offset, cy + offset)
 
-def getPlanes():
-  if FLAGS.invz:
-    return 1/np.linspace(1, 0.1, num_mpi) * dmin
+def getPlanes(mode=0):
+  if mode==0:
+    if FLAGS.invz:
+      return 1/np.linspace(1, 0.1, num_mpi) * dmin
+    else:
+      return np.linspace(dmin, dmax, num_mpi)
   else:
-    return np.linspace(dmin, dmax, num_mpi)
+    if FLAGS.invz:
+      return 1/np.linspace(1, 0.1, num_mpi*sub_sam) * dmin
+    else:
+      return np.linspace(dmin, dmax, num_mpi*sub_sam)
 
-def network(mpi, depth, bg, rot,tra, is_training):
+def network(mpi, depth, rot,tra, is_training):
   alpha = 1
   output = 0
   mask = 0.0
@@ -179,31 +254,108 @@ def network(mpi, depth, bg, rot,tra, is_training):
   sublayers = []
   planes = getPlanes()
   rplanes = np.concatenate([planes, 2*planes[-1:]-planes[-2:-1]])
+  mpic = mpi[:,:,:,:3]
+  mpia = mpi[:,:,:,3:4]
 
   for i, v in enumerate(planes):
       aa = 1
       out = 0
+
+      #plane = mpi[i]
+      #alphasi = depth[i]
+      plane = mpic[i]
+      alphasi = mpia[i]
+      depthi = depth[i]
       for j in range(sub_sam):
           vv = j/sub_sam
-          dep = rplanes[i]*(1-vv) + rplanes[i+1]*(vv)
-          depth_map = depth[i,:,:,j:j+1]
-          img = samplePlane(tf.concat([mpi[i], depth_map], -1),rot,tra, dep, 1)
-          #tf.compat.v1.add_to_collection("checkpoints", img)
-          img = img[0]
-          #output += img[:,:,:3]*img[:,:,4:5]*alpha
-          #alpha *= (1-img[:,:,4:5])
-          #mask += img[:,:,4:5]*alpha
-          out += img[:,:,:4]*img[:,:,4:5]*aa
-          aa  *= (1-img[:,:,4:5])
-          depth_map = tf.image.resize(depth_map, [int(h/8), int(w/8)], tf.image.ResizeMethod.AREA)
-          sublayers.append(depth_map)
-          if j == 0:
-              imgs.append(img)
-      output += out[:,:,:3]*out[:,:,3:4]*alpha
-      alpha *= (1-out[:,:,3:4])
-      mask += out[:,:,3:4]*alpha
+          if FLAGS.invz:
+            dep = 1/(1/rplanes[i]*(1-vv) + 1/rplanes[i+1]*(vv))
+          else:
+            dep = rplanes[i]*(1-vv) + rplanes[i+1]*(vv)
+            
+          depth_map = alphasi * depthi[:,:,j:j+1]
+          #img = samplePlane(tf.concat([plane, depth_map], -1), rot, tra, dep, 1)
+          #img = img[0]
+          #mul = img[:,:,3:4] #* img[:,:,4:5]
+          #output += img[:,:,:3] * mul * alpha
+          mul = samplePlane(depth_map, rot, tra, dep, 1)
+          output += samplePlane(plane, rot, tra, dep, 1) * mul * alpha
+          alpha *= (1-mul)
 
-  output += (1-mask)*bg
+          if not is_training:
+            depth_map = tf.image.resize(depth_map, [int(h/8), int(w/8)], tf.image.ResizeMethod.AREA)
+            sublayers.append(depth_map)
+            if j == 0:
+                imgs.append(mul)
+                
+  return output, imgs, sublayers
+
+def network2(mpi, depth, rot,tra, is_training):
+  alpha = 1
+  output = 0
+  mask = 0.0
+  imgs = []
+  sublayers = []
+  planes = getPlanes()
+  dep = getPlanes(1)
+  rplanes = np.concatenate([planes, 2*planes[-1:]-planes[-2:-1]])
+  #mpi = tf.tile(mpi,[sub_sam,1,1,1])
+  #img = samplePlane(tf.concat([mpi, depth], -1), rot, tra, dep, 1)
+
+  for i, v in enumerate(planes):
+      #plane = mpi[i:i+1]
+      img = samplePlane2(tf.concat([tf.tile(mpi[i:i+1],[sub_sam,1,1,1]), depth[i*sub_sam:(i+1)*sub_sam]], -1), rot, tra, dep[i*sub_sam:(i+1)*sub_sam], 1)
+      for j in range(sub_sam):          
+          img0 = img[j]
+          mul = img0[:,:,3:4] * img0[:,:,4:5]
+          output += img0[:,:,:3] * mul * alpha
+          alpha *= (1-mul)
+
+                
+  return output, imgs, sublayers
+
+def network3(mpi, depth, rot,tra, is_training):
+  alpha = 1
+  output = 0
+  mask = 0.0
+  imgs = []
+  sublayers = []
+  planes = getPlanes()
+  rplanes = np.concatenate([planes, 2*planes[-1:]-planes[-2:-1]])
+  #mpic = mpi[:,:,:,:3]
+  #mpia = mpi[:,:,:,3:4]
+
+  for i, v in enumerate(planes):
+      aa = 1
+      out = 0
+
+      plane = mpi[i]
+      alphasi = depth[i]
+      #plane = mpic[i]
+      #alphasi = mpia[i]
+      #depthi = depth[i]
+      for j in range(sub_sam):
+          vv = j/sub_sam
+          if FLAGS.invz:
+            dep = 1/(1/rplanes[i]*(1-vv) + 1/rplanes[i+1]*(vv))
+          else:
+            dep = rplanes[i]*(1-vv) + rplanes[i+1]*(vv)
+            
+          depth_map = alphasi[:,:,j:j+1]
+          img = samplePlane(tf.concat([plane, depth_map], -1), rot, tra, dep, 1)
+          #img = img[0]
+          mul = img[:,:,3:4] #* img[:,:,4:5]
+          output += img[:,:,:3] * mul * alpha
+          #mul = samplePlane(depth_map, rot, tra, dep, 1)
+          #output += samplePlane(plane, rot, tra, dep, 1) * mul * alpha
+          alpha *= (1-mul)
+
+          if not is_training:
+            depth_map = tf.image.resize(depth_map, [int(h/8), int(w/8)], tf.image.ResizeMethod.AREA)
+            sublayers.append(depth_map)
+            if j == 0:
+                imgs.append(mul)
+                
   return output, imgs, sublayers
 
 def gen_mpi(input,is_train):
@@ -336,15 +488,19 @@ def gen_alpha(input,is_train,reuse=False):
 def train():
     global nh, nw, img_ref
     lod_in = tf.compat.v1.placeholder(tf.float32, shape=[], name='lod_in')
-    rot = tf.compat.v1.placeholder(tf.float32, shape=[3,3], name='rotation')
-    tra = tf.compat.v1.placeholder(tf.float32, shape=[3,1], name='translation')
-    real_img = tf.compat.v1.placeholder(tf.float32, shape=[h,w,3], name='ex_img')
+    #rot = tf.compat.v1.placeholder(tf.float32, shape=[3,3], name='rotation')
+    #tra = tf.compat.v1.placeholder(tf.float32, shape=[3,1], name='translation')
+    #real_img = tf.compat.v1.placeholder(tf.float32, shape=[h,w,3], name='ex_img')
+    features = load_data(0,is_shuff = True)
+    rot = features["r"][0]
+    tra = features["t"][0]
+    real_img = features["img"][0]
 
 
-    int_mpi1 = np.random.uniform(-1, 0,[num_mpi, nh, nw, 3]).astype(np.float32)
+    int_mpi1 = np.random.uniform(-1, 1,[num_mpi, nh, nw, 3]).astype(np.float32)
     int_mpi2 = np.random.uniform(-5,-1,[num_mpi, nh, nw, 1]).astype(np.float32)
     int_mpi = np.concatenate([int_mpi1,int_mpi2],-1)
-    depth_init = np.random.uniform(-5,0,[num_mpi, int(h/ FLAGS.subscale), int(w/ FLAGS.subscale), sub_sam]).astype(np.float32)
+    depth_init = np.random.uniform(-5,0,[num_mpi, int(nh/ FLAGS.subscale), int(nw/ FLAGS.subscale), sub_sam]).astype(np.float32)
     #if(FLAGS.sublayers<1):
     #  depth = tf.get_variable("Net_depth", initializer=depth_init*0+1, trainable=False)
     #else:
@@ -358,20 +514,26 @@ def train():
     lr = tf.compat.v1.train.exponential_decay(0.1,lod_in,1000,0.5)
     optimizer = tf.compat.v1.train.AdamOptimizer(lr)
     #optimizer = tf.train.RMSPropOptimizer(lr)
-    with tf.compat.v1.variable_scope("Net"):
+    with tf.compat.v1.variable_scope("Net%d"%(FLAGS.index)):
         mpi = tf.compat.v1.get_variable("mpi", initializer=int_mpi, trainable=True)
         mpi = tf.sigmoid(mpi)
-        if FLAGS.sublayers<1: depth = tf.get_variable("Net_depth", initializer=np.ones((num_mpi,3,3,1)), trainable=False)
-        else: depth = gen_depth(mpi,True)
-        depth = tf.image.resize(depth, [nh, nw], align_corners=True)
-        img_out, shifts, sss = network(mpi, depth, bg, rot,tra, False)
-        long = tf.concat(shifts, 1)
+        if True:
+          depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
+          depth0 = tf.sigmoid(depth)
+          depth = tf.image.resize(depth0, [nh, nw], align_corners=True)
+        else:
+          if FLAGS.sublayers<1: depth = tf.get_variable("Net_depth", initializer=np.ones((num_mpi,3,3,1)), trainable=False)
+          else: depth = gen_depth(mpi,True)
+          depth = tf.image.resize(depth, [nh, nw], align_corners=True)
+        
+        img_out, shifts, sss = network(mpi, depth, rot,tra, False)
+        #long = tf.concat(shifts, 1)
 
-        real_result = Multi_discriminator(real_img,True)
-        fake_result = Multi_discriminator(img_out,True, reuse=True)
+        #real_result = Multi_discriminator(real_img,True)
+        #fake_result = Multi_discriminator(img_out,True, reuse=True)
 
 
-    with tf.compat.v1.variable_scope("loss"):
+    with tf.compat.v1.variable_scope("loss%d"%(FLAGS.index)):
         tva = tf.constant(0.1) 
         tvc = tf.constant(0.005) 
         avl = tf.constant(0.01) 
@@ -383,10 +545,10 @@ def train():
         loss += tvc * tf.reduce_mean(tf.image.total_variation(mpiColor))
         #loss += avl * tf.reduce_mean(tf.image.total_variation(depth0))
         #loss += avl * tf.reduce_mean(abs(depth0[:,:,:,:-1] - depth0[:,:,:,1:]) )
-        g_loss = tf.reduce_mean(tf.square(fake_result))
+        #g_loss = tf.reduce_mean(tf.square(fake_result))
         #loss += avl * g_loss
 
-        d_loss = tf.reduce_mean(tf.square(fake_result-1)) + tf.reduce_mean(tf.square(real_result))
+        #d_loss = tf.reduce_mean(tf.square(fake_result-1)) + tf.reduce_mean(tf.square(real_result))
 
     t_vars = tf.compat.v1.trainable_variables()
     d_vars = [var for var in t_vars if 'dis' in var.name]
@@ -395,10 +557,10 @@ def train():
     with tf.compat.v1.variable_scope("post%d"%(FLAGS.index)):
         image_out = tf.clip_by_value(img_out,0.0,1.0)
         train_op = slim.learning.create_train_op(loss,optimizer,variables_to_train=g_vars)
-        train_dis = slim.learning.create_train_op(d_loss,optimizer,variables_to_train=d_vars)
-        train_gen = slim.learning.create_train_op(g_loss,optimizer,variables_to_train=g_vars)
+        #train_dis = slim.learning.create_train_op(d_loss,optimizer,variables_to_train=d_vars)
+        #train_gen = slim.learning.create_train_op(g_loss,optimizer,variables_to_train=g_vars)
         
-        long = tf.clip_by_value(long,0.0,1.0)
+        #long = tf.clip_by_value(long,0.0,1.0)
 
         summary = tf.compat.v1.summary.merge([
                         tf.compat.v1.summary.scalar("all_loss", loss),
@@ -407,8 +569,8 @@ def train():
 
                         tf.compat.v1.summary.image("out",tf.expand_dims(image_out,0)),
                         tf.compat.v1.summary.image("origi",tf.expand_dims(real_img,0)),
-                        tf.compat.v1.summary.image("alpha",tf.expand_dims(long[:,:,3:4],0)),
-                        tf.compat.v1.summary.image("color",tf.expand_dims(long[:,:,:3],0)),
+                        #tf.compat.v1.summary.image("alpha",tf.expand_dims(long[:,:,3:4],0)),
+                        #tf.compat.v1.summary.image("color",tf.expand_dims(long[:,:,:3],0)),
                         #tf.compat.v1.summary.image("map_areal",real_result),
                         #tf.compat.v1.summary.image("map_fake",tf.concat([real_result,fake_result],2)),
                         #tf.compat.v1.summary.image("map_fake",fake_result),
@@ -432,7 +594,7 @@ def train():
     if not os.path.exists(localpp):
         os.makedirs(localpp)
 
-    features = load_data(0,is_shuff = True)
+    
     sess = tf.compat.v1.Session(config=config)
     if 0:
         variables_to_restore = slim.get_variables_to_restore()
@@ -447,15 +609,17 @@ def train():
           saver.restore(sess, ckpt)
         else:
           sess.run(tf.compat.v1.global_variables_initializer())
+    print("var",slim.get_variables_to_restore())
 
     rot1 = ref_r
     tra1 = ref_t
     mean_loss = 1000
     for i in range(FLAGS.epoch + 3):
-        feed = sess.run(features)
+        #feed = sess.run(features)
+        #feedlis = {lod_in:i,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]}
+        feedlis = {lod_in:i}
         #for j in range(0):
           #feed = sess.run(features)
-        feedlis = {lod_in:i,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]}
           #_,dlos = sess.run([train_dis,d_loss],feed_dict=feedlis)
           #rand = np.random.rand()*1.2 - 0.1
           #rot1 = interpolate_rotation(rot1, feed["r"][0], rand)
@@ -466,18 +630,18 @@ def train():
 
         if i < 6000:
             _,los = sess.run([train_op,loss],feed_dict=feedlis)
-        else:
-            _,los = sess.run([train_op,loss],feed_dict={lod_in:600,avl:1000,tvc:0.0,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
-        mean_loss = mean_loss*0.7 + los*0.3
-        if mean_loss*1.05 < los:
-          _,los = sess.run([train_op,loss],feed_dict=feedlis)
+        #else:
+        #    _,los = sess.run([train_op,loss],feed_dict={lod_in:600,avl:1000,tvc:0.0,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
+        #mean_loss = mean_loss*0.7 + los*0.3
+        #if mean_loss*1.05 < los:
+        #  _,los = sess.run([train_op,loss],feed_dict=feedlis)
         #for j in range(5):
         #    _,dlos = sess.run([train_dis,d_loss],feed_dict={lod_in:600,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
     
         if i%100==0:
             print(FLAGS.index,i, "loss = " ,los)
         if i%20 == 0:
-            summ = sess.run(summary,feed_dict={lod_in:i,rot:feed["r"][0],tra:feed["t"][0],real_img:feed["img"][0]})
+            summ = sess.run(summary,feed_dict=feedlis)
             writer.add_summary(summ,i)
         if i%200==1:
             saver.save(sess, localpp + '/' + str(i))
@@ -508,10 +672,10 @@ def predict():
 
     nh = h + offset * 2
     nw = w + offset * 2
-    bg = tf.compat.v1.get_variable("Net_bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
-    bg = tf.sigmoid(bg)
+    #bg = tf.compat.v1.get_variable("Net_bg", initializer=np.array([1,1,1],dtype=np.float32), trainable=True)
+    #bg = tf.sigmoid(bg)
 
-    depth_init = np.random.uniform(-5,0,[num_mpi, int(h/ FLAGS.subscale), int(w/ FLAGS.subscale), sub_sam]).astype(np.float32)
+    depth_init = np.random.uniform(-5,0,[num_mpi, int(nh/ FLAGS.subscale), int(nw/ FLAGS.subscale), sub_sam]).astype(np.float32)
 
     mpi = np.zeros([num_mpi, nh, nw, 4],dtype=np.float32)
     mpi[0] = [1.,0.,0.,.95]
@@ -519,23 +683,27 @@ def predict():
     mpi[2] = [1.,1.,0.,.95]
     mpi[3] = [.5,1.,0.,.95]
 
-    #depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
-    #depth = tf.sigmoid(depth)
+
     #depth = tf.image.resize(depth, [h, w], align_corners=True)
     img_reff = tf.convert_to_tensor(img_ref)
     img_reff = tf.expand_dims(img_reff,0)
 
 
-    with tf.compat.v1.variable_scope("Net"):
+    with tf.compat.v1.variable_scope("Net%d"%(FLAGS.index)):
         mpi = tf.compat.v1.get_variable("mpi", initializer=mpi, trainable=False)
         mpi = tf.sigmoid(mpi)
-        #mpi = gen_mpi(img_reff,False)
-        depth = gen_depth(mpi,False)
-        depth = tf.image.resize(depth, [nh, nw], align_corners=True)
-        img_out, shifts, sss = network(mpi, depth, bg, rot,tra, False)
+        if True:
+          depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
+          depth0 = tf.sigmoid(depth)
+          depth = tf.image.resize(depth0, [nh, nw], align_corners=True)
+        else:
+          if FLAGS.sublayers<1: depth = tf.get_variable("Net_depth", initializer=np.ones((num_mpi,3,3,1)), trainable=False)
+          else: depth = gen_depth(mpi,True)
+          depth = tf.image.resize(depth, [nh, nw], align_corners=True)
+        img_out, shifts, sss = network(mpi, depth, rot,tra, False)
         long = tf.concat(shifts, 1)
 
-    with tf.compat.v1.variable_scope("post"):
+    with tf.compat.v1.variable_scope("post%d"%(FLAGS.index)):
         image_out= tf.clip_by_value(img_out,0.0,1.0)
         longs = tf.clip_by_value(long,0.0,1.0) 
 
@@ -545,6 +713,7 @@ def predict():
     sess = tf.compat.v1.Session(config=config)
     sess.run(tf.compat.v1.global_variables_initializer())
     variables_to_restore = slim.get_variables_to_restore()
+    print("var",variables_to_restore)
     saver = tf.train.Saver(variables_to_restore)
     #localpp = getLocalPath("/home2/suttisak",'./model/' + FLAGS.dataset +'/'+ FLAGS.input+str((FLAGS.index)%mpi_max))
     localpp = './model/' + FLAGS.dataset +'/tem'+str((FLAGS.index))
