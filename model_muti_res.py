@@ -45,37 +45,8 @@ dmin, dmax = -1, -1
 num_ = 2
 nh, nw = 0 , 0
 img_ref = 0
-is_gen_mpi = True
+is_gen_mpi = False
 is_gen_depth = False
-
-
-def load_data(i,is_shuff=False):
-  def parser(serialized_example):
-    fs = tf.parse_single_example(
-        serialized_example,
-        features={
-          "img": tf.FixedLenFeature([], tf.string),
-          "r": tf.FixedLenFeature([9], tf.float32),
-          "t": tf.FixedLenFeature([3], tf.float32),
-          "h": tf.FixedLenFeature([], tf.int64),
-          "w": tf.FixedLenFeature([], tf.int64),
-        })
-
-    fs["img"] = tf.to_float(tf.image.decode_png(fs["img"], 3)) / 255.0
-    if FLAGS.scale < 1:
-      fs["img"] = tf.image.resize(fs["img"], [h, w], tf.image.ResizeMethod.AREA)
-
-    fs["r"] = tf.reshape(fs["r"], [3, 3])
-    fs["t"] = tf.reshape(fs["t"], [3, 1])
-    return fs
-
-  localpp = "datasets/" + FLAGS.dataset + "/" + FLAGS.input + ".train"
-  dataset = tf.data.TFRecordDataset([localpp])
-  dataset = dataset.map(parser)
-  if(is_shuff):  dataset = dataset.shuffle(5)
-  dataset = dataset.repeat().batch(FLAGS.batch_size)
-
-  return dataset.make_one_shot_iterator().get_next()
 
 def setGlobalVariables():
   global f, px, py, ref_r, ref_t, ref_c, w, h, img_ref, nh, nw
@@ -149,6 +120,7 @@ def network(mpi, depth, rot,tra, is_training):
   sublayers = []
   planes = getPlanes()
   print(planes)
+  mask = 1
   rplanes = np.concatenate([planes, 2*planes[-1:]-planes[-2:-1]])
   mpic, mpia = mpi[:,:,:,:3], mpi[:,:,:,3:4]
   x, y = tf.meshgrid(list(range(w)), list(range(h)))
@@ -167,6 +139,8 @@ def network(mpi, depth, rot,tra, is_training):
         newCoords = tf.matmul(coords, tf.transpose(H))
         cxy = tf.expand_dims(newCoords[:, :, :2] / newCoords[:, :, 2:3], 0) + offset
         warp = cxy if j==0 else tf.concat([warp,cxy],0)
+        if i*j==0 : mask *= tf.contrib.resampler.resampler(tf.ones_like(mpia[i:i+1]),cxy)
+        if i+1==num_mpi and j+1==sub_sam : mask *= tf.contrib.resampler.resampler(tf.ones_like(mpia[i:i+1]),cxy)
 
       a1 =  tf.transpose(depth[i:i+1], perm=[3,1,2,0])
       a2 =  mpia[i:i+1] * a1
@@ -176,9 +150,13 @@ def network(mpi, depth, rot,tra, is_training):
       img3 = tf.contrib.resampler.resampler(a3,warp)
       weight = tf.cumprod(1 - img1,0,exclusive=True)
       output += tf.reduce_sum(weight*img3,0,keepdims=True)*alpha
-      alpha *= 1 - tf.reduce_sum(weight*img2,0,keepdims=True)
+      alpha_mul = 1 - tf.reduce_sum(weight*img2,0,keepdims=True)
+      alpha *= alpha_mul
+      if i==1: com_alpha = calpha*alpha_mul
+      if i>1: com_alpha = tf.concat([com_alpha,calpha*alpha_mul],0)
+      calpha = alpha_mul
 
-  return output[0], alpha
+  return output[0], com_alpha, mask
 
 def gen_mpi(mpi,lod_in,is_train=True):
   with tf.variable_scope('gen',reuse=tf.AUTO_REUSE) :
@@ -264,14 +242,14 @@ def train(logres=4):
     iter = tf.compat.v1.placeholder(tf.float32, shape=[], name='iter')
     lod_in = tf.compat.v1.placeholder(tf.float32, shape=[], name='lod_in')
     
-    features = load_data(0,is_shuff = True)
+    features = load_data(FLAGS.dataset,FLAGS.input,[h,w],is_shuff = True)
     rot = features["r"][0]
     tra = features["t"][0]
     real_img = features["img"][0]
 
     int_mpi1 = np.random.uniform(-1, 1,[num_mpi, nh, nw, 3]).astype(np.float32)
-    int_mpi2 = np.random.uniform(-5,-3,[num_mpi, nh, nw, 1]).astype(np.float32)
-    int_mpi = np.concatenate([int_mpi1,int_mpi2],-1)
+    int_mpi2 = np.random.uniform(-5,-3,[num_mpi-1, nh, nw, 1]).astype(np.float32)
+    #int_mpi = np.concatenate([int_mpi1,int_mpi2],-1)
     depth_init = np.random.uniform(-5,0,[num_mpi, int(nh/ FLAGS.subscale), int(nw/ FLAGS.subscale), sub_sam]).astype(np.float32)
     int_noise = np.random.uniform(-1,-1,[num_mpi, int(nh/ 2), int(nw/ 2), 4]).astype(np.float32)
 
@@ -282,39 +260,46 @@ def train(logres=4):
       if is_gen_mpi:
         noise = tf.compat.v1.get_variable("noise", initializer=int_noise, trainable=True)
         mpic = gen_mpi(noise,lod_in,is_train=True)
-        mpia = tf.compat.v1.get_variable("mpi_a", initializer=int_mpi2, trainable=True)
-        mpi = tf.concat([mpic,mpia],-1)
       else:
-        mpi = tf.compat.v1.get_variable("mpi", initializer=int_mpi, trainable=True)      
+        mpic = tf.compat.v1.get_variable("mpi_c", initializer=int_mpi1, trainable=True)   
+      mpia1 = tf.compat.v1.get_variable("mpi_a", initializer=int_mpi2, trainable=True)
+      mpia2 = tf.compat.v1.get_variable("mpi_la", initializer=int_mpi2[0:1]*0+5, trainable=False)
+      mpia = tf.concat([mpia1,mpia2],0)   
+      mpi = tf.concat([mpic,mpia],-1)
       mpi_sig = tf.sigmoid(mpi)
-      #mpi = coarse2fine(mpi,lod_in,logres)
-      mpi = tf.concat([mpi[:,:,:,:3],coarse2fine(mpi[:,:,:,3:],lod_in,logres)],-1)
+      mpi = coarse2fine(mpi,lod_in,logres)
+      #mpi = tf.concat([mpi[:,:,:,:3],coarse2fine(mpi[:,:,:,3:],lod_in,logres)],-1)
 
       if is_gen_depth:
         if FLAGS.sublayers<1: depth = tf.get_variable("Net_depth", initializer=np.ones((num_mpi,3,3,1)), trainable=False)
         else: depth = gen_depth(mpi,True)
       else:
-        depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
+        depth1 = tf.get_variable("Net_depth", initializer=depth_init[:num_mpi-1], trainable=True)
+        depth2 = tf.get_variable("depth2", initializer=depth_init[num_mpi-1:,:,:,:sub_sam-1], trainable=True)
+        depth3 = tf.get_variable("depth3", initializer=depth_init[num_mpi-1:,:,:,:1]*0+5, trainable=False)
+        depth = tf.concat([depth2,depth3],-1)
+        depth = tf.concat([depth1,depth],0)
         depth = tf.sigmoid(depth)
       depth = tf.image.resize(depth, [nh, nw], align_corners=True)
 
       
-      img_out, allalpha = network(mpi_sig, depth, rot,tra, False)
+      img_out, allalpha, mask = network(mpi_sig, depth, rot,tra, False)
       long2 = tf.reshape(mpi,(1,num_mpi*nh,nw,4))
 
 
     with tf.compat.v1.variable_scope("loss%d"%(FLAGS.index)):
-      mask = tf.cast(tf.greater(tf.math.reduce_sum(real_img,2,keepdims=True),0.05),tf.float32)
+      mask *= tf.cast(tf.greater(tf.math.reduce_sum(real_img,2,keepdims=True),0.05),tf.float32)
+      #mask = mask*.99 + (1-mask)*.01
       fac = (1 - iter/(1500*2))
       tva = tf.constant(0.1) * fac
-      tvc = tf.constant(0.005) * 0.001 * fac
+      tvc = tf.constant(0.005)  * fac
+      if is_gen_mpi: tvc *= 0.001
       mpiColor = mpi_sig[:, :, :, :3]
       mpiAlpha = mpi_sig[:, :, :, 3:4]
       loss =  100000 * tf.reduce_mean(tf.square(img_out - real_img)*mask)
       loss += tva * tf.reduce_mean(tf.image.total_variation (mpiAlpha))
+      #loss += 2000 * tf.reduce_mean((allalpha*2)-tf.round(allalpha*2))
       loss += tvc * tf.reduce_mean(tf.image.total_variation(mpiColor))
-      alpha_loss = 3000 * tf.reduce_mean(allalpha)
-      loss += alpha_loss
 
     t_vars = tf.compat.v1.trainable_variables()
     d_vars = [var for var in t_vars if 'dis' in var.name]
@@ -418,21 +403,28 @@ def predict():
     with tf.compat.v1.variable_scope("Net%d"%(FLAGS.index)):
         if is_gen_mpi:
           noise = tf.compat.v1.get_variable("noise", initializer=int_noise, trainable=False)
-          mpic = gen_mpi2(noise,lod_in,is_train=True)
-          mpia = tf.compat.v1.get_variable("mpi_a", initializer=mpi[:,:,:,3:4], trainable=False)
-          mpi = tf.concat([mpi,mpia],-1)
+          mpic = gen_mpi(noise,lod_in,is_train=True)
         else:
-          mpi = tf.compat.v1.get_variable("mpi", initializer=mpi, trainable=False)
+          mpic = tf.compat.v1.get_variable("mpi_c", initializer=mpi[:,:,:,:3], trainable=False)   
+        mpia1 = tf.compat.v1.get_variable("mpi_a", initializer=mpi[:num_mpi-1,:,:,3:4], trainable=False)
+        mpia2 = tf.compat.v1.get_variable("mpi_la", initializer=mpi[:1,:,:,3:4]*0+5, trainable=False)
+        mpia = tf.concat([mpia1,mpia2],0)   
+        mpi = tf.concat([mpic,mpia],-1)
 
         mpi = tf.sigmoid(mpi)
         if is_gen_depth:
           if FLAGS.sublayers<1: depth = tf.get_variable("Net_depth", initializer=np.ones((num_mpi,3,3,1)), trainable=False)
           else: depth0 = gen_depth(mpi,True)
         else:
-          depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
+          depth1 = tf.get_variable("Net_depth", initializer=depth_init[:num_mpi-1], trainable=True)
+          depth2 = tf.get_variable("depth2", initializer=depth_init[num_mpi-1:,:,:,:sub_sam-1], trainable=True)
+          depth3 = tf.get_variable("depth3", initializer=depth_init[num_mpi-1:,:,:,:1]*0+5, trainable=False)
+          depth = tf.concat([depth2,depth3],-1)
+          depth = tf.concat([depth1,depth],0)
+          #depth = tf.get_variable("Net_depth", initializer=depth_init, trainable=True)
           depth0 = tf.sigmoid(depth)
         depth = tf.image.resize(depth0, [nh, nw], align_corners=True)
-        img_out,  allalpha = network(mpi, depth, rot,tra, False)
+        img_out,  allalpha, mask = network(mpi, depth, rot,tra, False)
 
     with tf.compat.v1.variable_scope("post%d"%(FLAGS.index)):
         image_out= tf.clip_by_value(img_out,0.0,1.0)
@@ -455,11 +447,11 @@ def predict():
 
         for i in range(0,300,1):
           feed = sess.run(features)
-          out = sess.run(image_out,feed_dict={rot:feed["r"][0],tra:feed["t"][0]})
+          out = sess.run(image_out,feed_dict={lod_in:0,rot:feed["r"][0],tra:feed["t"][0]})
           if(i%50==0): 
             print(i)
             plt.imsave("webpath/"+FLAGS.dataset+"_s%02d"%FLAGS.subscale+"/%04d.png"%( i),out)
-          plt.imsave("result/frame/"+FLAGS.dataset+"_s%02d"%FLAGS.subscale+"%04d.png"%( i),out)
+          plt.imsave("result/frame/"+FLAGS.dataset+"_%04d.png"%( i),out)
 
         cmd = 'ffmpeg -y -i ' + 'result/frame/'+FLAGS.dataset+'_%04d.png -c:v libx264 -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" -pix_fmt yuv420p webpath/'+FLAGS.dataset+"_s%02d"%FLAGS.subscale+'/moving.mp4'
         print(cmd)
@@ -470,7 +462,7 @@ def predict():
       if not os.path.exists(webpath + FLAGS.dataset+"_s%02d"%FLAGS.subscale):
           os.system("mkdir " + webpath + FLAGS.dataset+"_s%02d"%FLAGS.subscale)
 
-      ret, sublay = sess.run([mpi,depth0])
+      ret, sublay = sess.run([mpi,depth0],feed_dict={lod_in:0})
       sublayers = []
       mpis = []
       sublayers_combined = []
