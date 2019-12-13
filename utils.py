@@ -8,8 +8,29 @@ import math
 
 _EPS = np.finfo(float).eps * 4.0
 
+def lerp_clip(a, b, t): return a + (b - a) * tf.clip_by_value(t, 0.0, 1.0)
+
+def softzeroclip(x, slopeatzero=0.25):
+  upp = 0.99
+  up = (upp - 0.5) / slopeatzero
+  cond1 = tf.cast(tf.math.less(x, 0.0), tf.float32)
+  cond2 = tf.cast(tf.math.logical_and(tf.math.less(x, up), tf.math.greater_equal(x, 0.0)), tf.float32)
+  cond3 = tf.cast(tf.math.greater_equal(x, up), tf.float32)
+
+  a = tf.math.multiply(cond1, tf.sigmoid(x * slopeatzero / 0.25))
+  b = tf.math.multiply(cond2, slopeatzero * x + 0.5)
+  c = tf.math.multiply(cond3, tf.tanh((x-up) * slopeatzero/(1-upp))*(1-upp) + upp)
+  return a + b + c
+
 def get_pixel_value(img, u, v):
-    indices = tf.stack([ u, v], 3)
+    indices = tf.stack([ u, v], -1)
+    return tf.gather_nd(img, indices)
+
+def get_pixel_value2(img, u, v):
+    batch_idx = tf.range(0, tf.shape(img)[0])
+    batch_idx = tf.reshape(batch_idx, (tf.shape(img)[0], 1, 1))
+    b = tf.tile(batch_idx, (1, tf.shape(u)[1], tf.shape(u)[2]))
+    indices = tf.stack([b, u, v], -1)
     return tf.gather_nd(img, indices)
 
 def bilinear_sampler(img, x, y):
@@ -46,14 +67,58 @@ def bilinear_sampler(img, x, y):
     wc = (y-y0)*(x1-x)
     wd = (y-y0)*(x-x0)
 
-    wa = tf.expand_dims(wa, axis=3)
-    wb = tf.expand_dims(wb, axis=3)
-    wc = tf.expand_dims(wc, axis=3)
-    wd = tf.expand_dims(wd, axis=3)
+    wa = tf.expand_dims(wa, axis=-1)
+    wb = tf.expand_dims(wb, axis=-1)
+    wc = tf.expand_dims(wc, axis=-1)
+    wd = tf.expand_dims(wd, axis=-1)
 
     out = wa*Ia + wb*Ib + wc*Ic + wd*Id
 
     return out
+
+def bilinear_sampler2(img, x, y):
+    # x is in range 0..W
+    # y is in range 0..H
+    H = int(img.get_shape()[0])
+    W = int(img.get_shape()[1])
+    max_y = tf.cast(H-1, tf.int32)
+    max_x = tf.cast(W-1, tf.int32)
+    zero = tf.zeros([], dtype='int32')
+
+    x0 = tf.cast(tf.floor(x), tf.int32)
+    x1 = x0 + 1
+    y0 = tf.cast(tf.floor(y), tf.int32)
+    y1 = y0 + 1
+
+    x0 = tf.clip_by_value(x0, zero, max_x)
+    x1 = tf.clip_by_value(x1, zero, max_x)
+    y0 = tf.clip_by_value(y0, zero, max_y)
+    y1 = tf.clip_by_value(y1, zero, max_y)
+
+    Ia = get_pixel_value2(img, y0, x0)
+    Ib = get_pixel_value2(img, y0, x1)
+    Ic = get_pixel_value2(img, y1, x0)
+    Id = get_pixel_value2(img, y1, x1)
+
+    x0 = tf.cast(x0, tf.float32)
+    x1 = tf.cast(x1, tf.float32)
+    y0 = tf.cast(y0, tf.float32)
+    y1 = tf.cast(y1, tf.float32)
+
+    wa = (y1-y)*(x1-x)
+    wb = (y1-y)*(x-x0)
+    wc = (y-y0)*(x1-x)
+    wd = (y-y0)*(x-x0)
+
+    wa = tf.expand_dims(wa, axis=-1)
+    wb = tf.expand_dims(wb, axis=-1)
+    wc = tf.expand_dims(wc, axis=-1)
+    wd = tf.expand_dims(wd, axis=-1)
+
+    out = wa*Ia + wb*Ib + wc*Ic + wd*Id
+
+    return out
+
 def get_pixel_value3d(mpi, y, x, z):
     indices = tf.stack([z, y, x], -1)
     return tf.gather_nd(mpi, indices)
@@ -407,3 +472,14 @@ def downscale2d(x, factor=2):
                 return dx, lambda ddx: _downscale2d(ddx, factor)
             return y, grad
         return func(x)
+
+def coarse2fine(mpi,lod_in,logres):
+  mpis = []
+  for i in range(logres):
+      mpis.append(mpi)
+      mpi = downscale2d(mpi)
+  
+  for i in range(logres):
+      mpi = upscale2d(mpi)
+      mpi = lerp_clip(mpis[-1-i],mpi,i+lod_in-(logres-1))
+  return mpi
