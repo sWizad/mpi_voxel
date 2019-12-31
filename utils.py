@@ -483,3 +483,51 @@ def coarse2fine(mpi,lod_in,logres):
       mpi = upscale2d(mpi)
       mpi = lerp_clip(mpis[-1-i],mpi,i+lod_in-(logres-1))
   return mpi
+
+def load_data(dataset,input,h_w,batch=1,is_shuff=False):
+  def parser(serialized_example):
+    fs = tf.parse_single_example(
+        serialized_example,
+        features={
+          "img": tf.FixedLenFeature([], tf.string),
+          "r": tf.FixedLenFeature([9], tf.float32),
+          "t": tf.FixedLenFeature([3], tf.float32),
+          "h": tf.FixedLenFeature([], tf.int64),
+          "w": tf.FixedLenFeature([], tf.int64),
+        })
+
+    fs["img"] = tf.to_float(tf.image.decode_png(fs["img"], 3)) / 255.0
+    if True:#FLAGS.scale < 1:
+      fs["img"] = tf.image.resize(fs["img"], h_w, tf.image.ResizeMethod.AREA)
+
+    fs["r"] = tf.reshape(fs["r"], [3, 3])
+    fs["t"] = tf.reshape(fs["t"], [3, 1])
+    return fs
+
+  localpp = "datasets/" + dataset + "/" + input + ".train"
+  dataset = tf.data.TFRecordDataset([localpp])
+  dataset = dataset.map(parser)
+  if(is_shuff):  dataset = dataset.shuffle(5)
+  dataset = dataset.repeat().batch(batch)
+
+  return dataset.make_one_shot_iterator().get_next()
+
+def conv2d(x,k,filter=3,stride=[1,1,1,1],name=''):
+  w_int = tf.truncated_normal([filter, filter, x.shape[3].value, k], stddev=0.1)
+  #w = tf.Variable(w_int,name=name+"_w")
+  w = tf.get_variable(name+"_w",initializer=w_int, trainable=True)
+  out = tf.nn.conv2d(x,w,strides=stride,padding='SAME')
+  return lay_norm(out,name)
+
+def lay_norm(x,name=''):
+  a = tf.get_variable(name+"scale",shape=[x.shape[-1]],initializer=tf.initializers.random_normal())
+  a = tf.reshape(tf.cast(a,x.dtype),[1,1,1,-1])
+  b = tf.get_variable(name+"bias",shape=[x.shape[-1]],initializer=tf.initializers.zeros())
+  b = tf.reshape(tf.cast(b,x.dtype),[1,1,1,-1])
+  z = x - tf.reduce_mean(x,axis=[1,2],keepdims=True)
+  z *= tf.math.rsqrt(tf.reduce_mean(tf.square(z),axis=[1,2],keepdims=True))
+  z = a * z + b
+  return z
+
+def lrelu(x):
+   return tf.math.maximum(x,0.1*x)
